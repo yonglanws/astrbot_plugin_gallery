@@ -1,0 +1,70 @@
+{
+  "size_limit_mb": {
+    "description": "单张图片大小上限(MB)，超过会自动等比缩小",
+    "type": "float",
+    "default": 1.0,
+    "hint": "建议保持 1MB 以内，避免图片过大影响加载"
+  },
+  "pick_limit": {
+    "description": "一次 /看 最多查看的图片数量",
+    "type": "int",
+    "default": 5,
+    "hint": "防止一次发送过多图片导致刷屏"
+  },
+  "hash1_difference_threshold": {
+    "description": "感知哈希(hash1)汉明距离阈值，超过则判定为不同图片(粗筛)",
+    "type": "int",
+    "default": 5,
+    "hint": "值越大查重越宽松，越大误判重复越少但可能漏检"
+  },
+  "hash2_difference_threshold": {
+    "description": "像素哈希(hash2)MAE总和阈值，小于等于则判定为重复(精筛)",
+    "type": "int",
+    "default": 1000,
+    "hint": "值越大查重越宽松"
+  },
+  "user_recent_revert_expired_hours": {
+    "description": "普通用户撤销自己最近一次上传的有效时长(小时)",
+    "type": "int",
+    "default": 24,
+    "hint": "超过该时长后普通用户将无法撤销自己的上传"
+  },
+  "enable_slash_prefix": {
+    "description": "是否兼容 / 前缀。开启时 /看 与 看 都生效；关闭时仅接受不带 / 的裸指令",
+    "type": "bool",
+    "default": true,
+    "hint": "始终监听所有消息：开启时同时接受 /看 和 看；关闭时只接受 看"
+  },
+  "sync": {
+    "description": "百度网盘同步设置(需服务器已安装 bypy 并完成授权)",
+    "type": "object",
+    "hint": "通过 bypy 命令行工具定时上传画廊图片到百度网盘",
+    "items": {
+      "enable": {
+        "description": "是否启用百度网盘同步",
+        "type": "bool",
+        "default": false
+      },
+      "sync_times": {
+        "description": "同步时间点列表，每项为 [时, 分, 秒]",
+        "type": "list",
+        "default": [[3, 30, 0]]
+      },
+      "verbose": {
+        "description": "是否输出 bypy 详细日志",
+        "type": "bool",
+        "default": true
+      },
+      "remote_dir": {
+        "description": "百度网盘远端目录名",
+        "type": "string",
+        "default": "AstrBotGallery"
+      },
+      "share_link": {
+        "description": "图包分享链接(/下载图包 返回此链接)",
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}
