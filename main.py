@@ -468,16 +468,15 @@ class GalleryPlugin(Star):
         err_msg = ""
         repeats: list[tuple[str, int]] = []  # (待上传图临时路径, 相似 pid)
 
-        # 并发下载
-        async def download(url: str) -> str:
+        # 并发下载/取本地路径
+        async def fetch_local(url: str) -> str:
             try:
-                local = await download_image_by_url(url)
-                return local
+                return await self._localize_image(url)
             except Exception as e:
-                logger.warning(f"下载图片失败: {get_exc_desc(e)}")
+                logger.warning(f"获取图片失败: {get_exc_desc(e)}")
                 return ""
 
-        paths = await asyncio.gather(*[download(u) for u in image_urls])
+        paths = await asyncio.gather(*[fetch_local(u) for u in image_urls])
 
         for i, path in enumerate(paths, 1):
             if not path or not os.path.exists(path):
@@ -773,10 +772,9 @@ class GalleryPlugin(Star):
         image_urls = await self._extract_image_urls(event)
         if not image_urls:
             raise ReplyException("请附加要替换的图片")
-        url = image_urls[0]
-        local = await download_image_by_url(url)
+        local = await self._localize_image(image_urls[0])
         if not local or not os.path.exists(local):
-            raise ReplyException("下载图片失败")
+            raise ReplyException("获取图片失败")
         try:
             await asyncio.to_thread(process_image_for_gallery, local, 1, self.size_limit_mb)
             pid = await self.gallery_manager.async_replace_pic(
@@ -857,6 +855,31 @@ class GalleryPlugin(Star):
             raise ReplyException(f"上传群文件失败: {e}")
 
     # ==================== 辅助方法 ====================
+
+    async def _localize_image(self, src: str) -> str:
+        """把图片来源（网络 URL / file:/// / 本地路径 / base64）统一转为本地文件路径。
+
+        aiocqhttp 下 Image.file 常是本地路径或 file:/// 路径，不是 URL——
+        直接交给 download_image_by_url 会用 aiohttp 请求本地路径而报 InvalidUrlClientError。
+        """
+        if not src:
+            return ""
+        if src.startswith("file:///"):
+            return os.path.abspath(src[8:])
+        if src.startswith(("http://", "https://")):
+            return await download_image_by_url(src)
+        if src.startswith("base64://"):
+            import base64 as _b64
+            data = _b64.b64decode(src[9:])
+            dst = os.path.join(self.tmp_dir, f"imgseg_{datetime.now().strftime('%Y%m%d%H%M%S%f')}.jpg")
+            with open(dst, "wb") as f:
+                f.write(data)
+            return dst
+        # 本地路径（绝对或相对）
+        if os.path.exists(src):
+            return os.path.abspath(src)
+        # 兜底：尝试当 URL 下载（例如没带 http 前缀的链接）
+        return await download_image_by_url(src)
 
     async def _extract_image_urls(self, event: AstrMessageEvent) -> list[str]:
         """从消息中提取图片 URL。

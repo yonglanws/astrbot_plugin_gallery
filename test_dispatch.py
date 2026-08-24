@@ -509,7 +509,46 @@ async def main():
     )
 
     ok = r.summary()
-    sys.exit(0 if ok else 1)
+
+    # ---- 9. 上传：本地路径图片不应被当 URL 下载 ----
+    print("\n[测试] 本地路径图片上传")
+    plugin4 = make_plugin()
+    plugin4.gallery_manager.ensure_loaded()
+    plugin4.gallery_manager.open_gall("本地图")
+    await plugin4.gallery_manager._save()
+
+    # aiocqhttp 下 Image.file 常是本地相对路径或 file:/// 路径，不是 URL
+    import tempfile as _tf
+    local_img = os.path.join(_tf.gettempdir(), "gallery_local_upload.png")
+    from PIL import Image as _PImg
+    _PImg.new("RGBA", (40, 40), (10, 20, 30, 255)).save(local_img, format="PNG")
+
+    ev_local = MockEvent("上传 本地图")
+    ev_local.message_obj.message = [Comp.Image(file=local_img)]  # 纯本地路径，无 url
+    res_local = await run_handler(plugin4, ev_local)
+    # 不应出现 "下载图片失败" / InvalidUrlClientError，且应上传成功
+    uploaded = len(plugin4.gallery_manager.galleries["本地图"].pics)
+    r.check(
+        "本地路径图片直接使用不下载",
+        uploaded == 1 and not any("下载图片失败" in str(x) for x in res_local),
+        f"uploaded={uploaded} res={res_local}",
+    )
+
+    # file:/// 前缀也应识别为本地
+    plugin4.gallery_manager.galleries["本地图"].pics.clear()
+    local_img2 = os.path.join(_tf.gettempdir(), "gallery_local_upload2.png")
+    _PImg.new("RGBA", (40, 40), (40, 50, 60, 255)).save(local_img2, format="PNG")
+    ev_local2 = MockEvent("上传 本地图")
+    ev_local2.message_obj.message = [Comp.Image(file=f"file:///{local_img2}")]
+    await run_handler(plugin4, ev_local2)
+    r.check(
+        "file:/// 路径识别为本地",
+        len(plugin4.gallery_manager.galleries["本地图"].pics) == 1,
+        f"pics={len(plugin4.gallery_manager.galleries['本地图'].pics)}",
+    )
+
+    ok2 = r.summary()
+    sys.exit(0 if ok and ok2 else 1)
 
 
 if __name__ == "__main__":
