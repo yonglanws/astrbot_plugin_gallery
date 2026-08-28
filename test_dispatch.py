@@ -15,6 +15,10 @@ import asyncio
 import tempfile
 
 
+# 可被测试覆盖的下载映射：url -> bytes；供 mock 的 download_image_by_url 使用
+_url_to_bytes: dict = {}
+
+
 def _install_astrbot_mocks():
     if "astrbot" in sys.modules:
         return
@@ -85,7 +89,18 @@ def _install_astrbot_mocks():
         get_data_dir=lambda: os.path.join(tempfile.mkdtemp(prefix="gallery_rt_"))
     )
     io_mod = types.ModuleType("astrbot.core.utils.io")
-    io_mod.download_image_by_url = None  # 由 main.py 使用，路由测试中不会触发真实下载
+
+    async def _download_image_by_url(url, *a, **k):
+        # 复刻真实 save_temp_img：一律存 .jpg，即使原图是 gif/png
+        import os, tempfile, uuid
+        data = _url_to_bytes.get(url, b"")
+        d = tempfile.mkdtemp(prefix="dl_")
+        p = os.path.join(d, f"dl_{uuid.uuid4().hex[:8]}.jpg")
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    io_mod.download_image_by_url = _download_image_by_url
 
     # aiocqhttp 平台事件类（合并转发拉取时 isinstance 校验用）
     class AiocqhttpMessageEvent:
@@ -546,6 +561,75 @@ async def main():
         len(plugin4.gallery_manager.galleries["本地图"].pics) == 1,
         f"pics={len(plugin4.gallery_manager.galleries['本地图'].pics)}",
     )
+
+    # ---- 10. GIF 动图经 URL 上传后应保留 .gif 与多帧 ----
+    print("\n[测试] GIF 动图上传保留格式")
+    plugin5 = make_plugin()
+    plugin5.gallery_manager.ensure_loaded()
+    plugin5.gallery_manager.open_gall("动图")
+    await plugin5.gallery_manager._save()
+
+    # 造一张真正的多帧 gif
+    from PIL import Image as _PImg2
+    frames = [_PImg2.new("P", (64, 64)) for _ in range(3)]
+    for i, f in enumerate(frames):
+        f.putpalette(list(((255, 0, 0), (0, 255, 0), (0, 0, 255))[i]) * 3)
+    gif_buf = _tf.NamedTemporaryFile(suffix=".gif", delete=False)
+    frames[0].save(
+        gif_buf, format="GIF", save_all=True,
+        append_images=frames[1:], duration=200, loop=0, disposal=2,
+    )
+    gif_buf.close()
+    with open(gif_buf.name, "rb") as _f:
+        gif_bytes = _f.read()
+    _url_to_bytes["http://ex.com/anim.gif"] = gif_bytes
+
+    ev_gif = MockEvent("上传 动图")
+    ev_gif.message_obj.message = [Comp.Image(url="http://ex.com/anim.gif")]
+    await run_handler(plugin5, ev_gif)
+
+    pics = plugin5.gallery_manager.galleries["动图"].pics
+    r.check("GIF 经 URL 上传成功", len(pics) == 1, f"pics={len(pics)}")
+    if pics:
+        pic = pics[0]
+        r.check(
+            "落库扩展名为 .gif",
+            pic.file.lower().endswith(".gif"),
+            f"file={pic.file}",
+        )
+        im = _PImg2.open(pic.path)
+        r.check(
+            "落库仍是动图(多帧)",
+            getattr(im, "n_frames", 1) == 3 and getattr(im, "is_animated", False),
+            f"frames={getattr(im, 'n_frames', 1)}",
+        )
+
+    # aiocqhttp 常见情况：Image.file 是本地 .jpg/.png 路径，但内容其实是 GIF
+    plugin6 = make_plugin()
+    plugin6.gallery_manager.ensure_loaded()
+    plugin6.gallery_manager.open_gall("动图2")
+    await plugin6.gallery_manager._save()
+    misnamed = os.path.join(_tf.gettempdir(), "media_image_gif_as_png.png")
+    with open(misnamed, "wb") as _f:
+        _f.write(gif_bytes)
+    ev_mis = MockEvent("上传 动图2")
+    ev_mis.message_obj.message = [Comp.Image(file=misnamed)]
+    await run_handler(plugin6, ev_mis)
+    pics6 = plugin6.gallery_manager.galleries["动图2"].pics
+    r.check("误标 png 的 GIF 仍能上传", len(pics6) == 1, f"pics={len(pics6)}")
+    if pics6:
+        pic6 = pics6[0]
+        r.check(
+            "误标 png 的 GIF 落库为 .gif",
+            pic6.file.lower().endswith(".gif"),
+            f"file={pic6.file}",
+        )
+        im6 = _PImg2.open(pic6.path)
+        r.check(
+            "误标 png 的 GIF 仍是动图",
+            getattr(im6, "n_frames", 1) == 3 and getattr(im6, "is_animated", False),
+            f"frames={getattr(im6, 'n_frames', 1)} fmt={im6.format}",
+        )
 
     ok2 = r.summary()
     sys.exit(0 if ok and ok2 else 1)

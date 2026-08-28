@@ -524,8 +524,10 @@ class GalleryPlugin(Star):
                 save_dir=self.tmp_dir,
             )
 
-        msg = f"[#{hid}] " if hid else ""
-        msg += f'成功上传{len(ok_list)}/{len(image_urls)}张图片到"{name}"\n'
+        msg = f'成功上传{len(ok_list)}/{len(image_urls)}张图片到"{name}"'
+        if ok_list:
+            msg += f"（表情编号: {' '.join(str(p) for p in ok_list)}）"
+        msg += "\n"
         msg += err_msg
         if repeats:
             msg += f"{len(repeats)}张图片与已有图片重复"
@@ -861,25 +863,68 @@ class GalleryPlugin(Star):
 
         aiocqhttp 下 Image.file 常是本地路径或 file:/// 路径，不是 URL——
         直接交给 download_image_by_url 会用 aiohttp 请求本地路径而报 InvalidUrlClientError。
+        返回的临时文件扩展名按真实图片格式纠正，避免 gif 被存成 .jpg。
         """
         if not src:
             return ""
         if src.startswith("file:///"):
-            return os.path.abspath(src[8:])
+            return await asyncio.to_thread(
+                self._copy_with_correct_ext, os.path.abspath(src[8:])
+            )
         if src.startswith(("http://", "https://")):
-            return await download_image_by_url(src)
+            local = await download_image_by_url(src)
+            return await asyncio.to_thread(self._fix_ext_by_format, local)
         if src.startswith("base64://"):
             import base64 as _b64
             data = _b64.b64decode(src[9:])
-            dst = os.path.join(self.tmp_dir, f"imgseg_{datetime.now().strftime('%Y%m%d%H%M%S%f')}.jpg")
-            with open(dst, "wb") as f:
+            dst = os.path.join(self.tmp_dir, f"imgseg_{datetime.now().strftime('%Y%m%d%H%M%S%f')}")
+            with open(dst + ".bin", "wb") as f:
                 f.write(data)
-            return dst
-        # 本地路径（绝对或相对）
+            return await asyncio.to_thread(self._fix_ext_by_format, dst + ".bin")
+        # 本地路径（绝对或相对）。aiocqhttp 常把 GIF 落到 media_image_xxx.jpg/png
         if os.path.exists(src):
-            return os.path.abspath(src)
+            return await asyncio.to_thread(
+                self._copy_with_correct_ext, os.path.abspath(src)
+            )
         # 兜底：尝试当 URL 下载（例如没带 http 前缀的链接）
-        return await download_image_by_url(src)
+        local = await download_image_by_url(src)
+        return await asyncio.to_thread(self._fix_ext_by_format, local)
+
+    def _copy_with_correct_ext(self, path: str) -> str:
+        """复制到 tmp 后再按真实格式改扩展名，避免改写协议端缓存文件。"""
+        if not path or not os.path.exists(path):
+            return path
+        dst = os.path.join(
+            self.tmp_dir,
+            f"img_{datetime.now().strftime('%Y%m%d%H%M%S%f')}{os.path.splitext(path)[1]}",
+        )
+        shutil.copy2(path, dst)
+        return self._fix_ext_by_format(dst)
+
+    @staticmethod
+    def _fix_ext_by_format(path: str) -> str:
+        """按 PIL 识别的真实格式重命名文件扩展名（gif/jpg/png），避免 .jpg 误标 gif。"""
+        if not path or not os.path.exists(path):
+            return path
+        try:
+            from PIL import Image
+            with Image.open(path) as im:
+                fmt = (im.format or "").upper()
+        except Exception:
+            return path
+        ext_map = {"GIF": ".gif", "JPEG": ".jpg", "PNG": ".png"}
+        correct = ext_map.get(fmt)
+        if not correct:
+            return path
+        cur = os.path.splitext(path)[1].lower()
+        if cur == correct:
+            return path
+        new_path = os.path.splitext(path)[0] + correct
+        try:
+            os.replace(path, new_path)
+            return new_path
+        except OSError:
+            return path
 
     async def _extract_image_urls(self, event: AstrMessageEvent) -> list[str]:
         """从消息中提取图片 URL。
