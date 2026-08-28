@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import zipfile
 from datetime import datetime, timedelta
@@ -96,6 +97,9 @@ class GalleryPlugin(Star):
 
     # ==================== 指令路由 ====================
 
+    # 画廊不存在错误文案（画廊名不允许含引号，此匹配不会误伤其他错误）
+    _GALL_NOT_FOUND_RE = re.compile(r'画廊".+"不存在')
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """监听所有消息，分发画廊指令。兼容 / 前缀，也允许不带 /。
@@ -130,6 +134,9 @@ class GalleryPlugin(Star):
             async for result in self._dispatch(event, cmd, args):
                 yield result
         except ReplyException as e:
+            if self._GALL_NOT_FOUND_RE.fullmatch(str(e)):
+                # 画廊不存在：视为误触发，不回复也不拦截，放行给其他插件/LLM
+                return
             yield event.plain_result(str(e))
         except GalleryPicRepeatedException as e:
             yield event.plain_result(str(e))
@@ -138,8 +145,7 @@ class GalleryPlugin(Star):
         except Exception as e:
             logger.error(f"画廊指令处理出错 [{cmd}]: {get_exc_desc(e)}")
             yield event.plain_result(f"处理出错: {e}")
-        finally:
-            event.stop_event()
+        event.stop_event()
 
     # 长指令必须排在短指令前面，避免「看所有」被拆成「看」+「所有」
     _COMMANDS = (

@@ -431,6 +431,21 @@ async def main():
         len(res12) == 1 and "使用方式" in res12[0][1],
     )
 
+    # ---- 7b. 画廊不存在：静默放行，不回复也不拦截 ----
+    ev_nf = MockEvent("看 不存在的画廊")
+    res_nf = await run_handler(plugin3, ev_nf)
+    r.check("看 不存在画廊 不回复", len(res_nf) == 0, f"res={res_nf}")
+    r.check("看 不存在画廊 不拦截(放行传播)", ev_nf.stopped is False)
+
+    ev_nf2 = MockEvent("gall close 不存在的画廊", admin=True)
+    res_nf2 = await run_handler(plugin3, ev_nf2)
+    r.check(
+        "gall close 不存在画廊 不回复",
+        len(res_nf2) == 0,
+        f"res={res_nf2}",
+    )
+    r.check("原有画廊未受影响", "新画廊" in plugin3.gallery_manager.galleries)
+
     # ---- 8. 合并转发消息解析 ----
     print("\n[测试] 合并转发消息解析")
 
