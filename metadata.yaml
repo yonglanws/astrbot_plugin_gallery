@@ -2,6 +2,6 @@ name: astrbot_plugin_gallery
 display_name: 画廊
 desc: 群内图片画廊：上传、查看、查重、管理表情/梗图，支持别名、模式、封面、撤销上传、图包下载与百度网盘同步。
 version: v1.0.0
-author: mzkbot
+author: 慵懒午睡
 repo: https://github.com/yonglanws/astrbot_plugin_gallery
 astrbot_version: ">=4.0.0"
