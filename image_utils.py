@@ -95,6 +95,30 @@ def _limit_image_by_pixels(img: Image.Image, target_pixels: int) -> Image.Image:
     return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
 
+def _limit_animated_gif(img: Image.Image, target_pixels: int, path: str) -> None:
+    """等比缩小动图的所有帧并保存为 GIF，保留帧数与帧时长。
+
+    Image.resize 只作用于当前帧——对动画整图缩放会把动图退化成静帧，
+    因此必须用 ImageSequence 逐帧取出缩放后再拼接保存。
+    """
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+    for frame in ImageSequence.Iterator(img):
+        frames.append(_limit_image_by_pixels(frame.convert("RGBA"), target_pixels))
+        durations.append(frame.info.get("duration", 100) or 100)
+    if not frames:
+        return
+    frames[0].save(
+        path,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        disposal=2,
+        loop=0,
+    )
+
+
 def _save_transparent_static_gif(img: Image.Image, path: str) -> None:
     """保存为保留透明通道的静态 GIF（单帧）。
 
@@ -141,22 +165,27 @@ def process_image_for_gallery(path: str, sub_type: int, size_limit_mb: float) ->
     """
     img = Image.open(path)
     # 表情包静态图转静态 gif 以保留透明度（QQ 表情格式）
-    need_to_gif = bool(sub_type) and not _is_animated(img)
-
+    animated = _is_animated(img)
+    need_to_gif = bool(sub_type) and not animated
     scaled = False
+
     filesize_mb = os.path.getsize(path) / (1024 * 1024)
     if filesize_mb > size_limit_mb:
         pixels = _get_image_pixels(img)
-        img = _limit_image_by_pixels(img, int(pixels * size_limit_mb / filesize_mb))
+        target_pixels = int(pixels * size_limit_mb / filesize_mb)
+        if animated:
+            # 动图必须逐帧缩放；整图 resize 会退化为静帧
+            _limit_animated_gif(img, target_pixels, path)
+            new_size_mb = os.path.getsize(path) / (1024 * 1024)
+            logger.info(f"缩放过大的动图 {filesize_mb:.2f}M -> {new_size_mb:.2f}M")
+            return
+        img = _limit_image_by_pixels(img, target_pixels)
         scaled = True
 
     if need_to_gif:
         _save_transparent_static_gif(img, path)
     elif scaled:
-        if _is_animated(img):
-            _save_transparent_gif(img, _get_gif_duration(img), path)
-        else:
-            img.save(path)
+        img.save(path)
         new_size_mb = os.path.getsize(path) / (1024 * 1024)
         logger.info(f"缩放过大的图片 {filesize_mb:.2f}M -> {new_size_mb:.2f}M")
 

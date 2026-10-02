@@ -366,6 +366,38 @@ async def test_image_processing(r: TestResults, tmpdir):
     img = PImage.open(static_path)
     r.check("转换后为 GIF 格式", img.format == "GIF", f"format={img.format}")
 
+    # 超限动图：逐帧缩放，保留帧数与动画（整图 resize 会退化为静帧）
+    from PIL import ImageSequence as _ImgSeq
+    anim_path = os.path.join(tmpdir, "big_anim.gif")
+    frames = []
+    for _k in range(12):
+        frames.append(make_noise_image(  # 借用噪声生成，落盘后拼接帧
+            os.path.join(tmpdir, f"_frame_{_k}.png"), size=(500, 500), fmt="PNG"
+        ))
+    imgs = [PImage.open(p).convert("RGB") for p in frames]
+    imgs[0].save(
+        anim_path, format="GIF", save_all=True,
+        append_images=imgs[1:], duration=100, loop=0,
+    )
+    orig_n = PImage.open(anim_path).n_frames
+    orig_size = os.path.getsize(anim_path)
+    r.check("测试动图确超大小限制", orig_size > 1024 * 1024, f"size={orig_size}")
+
+    process_image_for_gallery(anim_path, sub_type=1, size_limit_mb=1.0)
+    after = PImage.open(anim_path)
+    r.check(
+        "超限动图保留帧数",
+        getattr(after, "n_frames", 1) == orig_n,
+        f"frames={getattr(after, 'n_frames', 1)}/{orig_n}",
+    )
+    r.check("超限动图仍为动画", getattr(after, "is_animated", False) is True)
+    r.check(
+        "超限动图已缩小",
+        os.path.getsize(anim_path) < orig_size,
+        f"{orig_size}->{os.path.getsize(anim_path)}",
+    )
+    del imgs, frames
+
 
 async def test_persistence(r: TestResults, tmpdir):
     """测试持久化：重新加载后数据一致。"""
