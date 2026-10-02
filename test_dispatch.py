@@ -178,9 +178,12 @@ class MockBotAPI:
 class MockEvent(AiocqhttpMessageEvent):
     """最小事件 mock。"""
 
-    def __init__(self, message_str, admin=False, bot_api: MockBotAPI | None = None):
+    def __init__(self, message_str, admin=False, bot_api: MockBotAPI | None = None,
+                 wake=True):
         self.message_str = message_str
         self._admin = admin
+        # AstrBot 唤醒标记：@机器人/唤醒前缀/私聊为 True
+        self.is_at_or_wake_command = wake
         self.message_obj = types.SimpleNamespace(message=[])
         self.stopped = False
         self.sent = []
@@ -189,6 +192,13 @@ class MockEvent(AiocqhttpMessageEvent):
 
     def is_admin(self):
         return self._admin
+
+    def get_platform_name(self):
+        return "aiocqhttp"
+
+    @property
+    def unified_msg_origin(self):
+        return "aiocqhttp:GroupMessage:mock_group"
 
     def stop_event(self):
         self.stopped = True
@@ -243,8 +253,20 @@ async def run_handler(plugin, event):
     return results
 
 
+async def run_native(plugin, event, name):
+    """调用原生指令 handler（模拟 AstrBot CommandFilter 命中后的调用）。"""
+    results = []
+    async for r in getattr(plugin, name)(event):
+        results.append(r)
+    return results
+
+
 def make_plugin(config=None):
-    return GalleryPlugin(types.SimpleNamespace(), dict(config or {}))
+    # 默认开启兼容监听模式，保持既有用例经由 on_message 触发；
+    # 触发模式相关用例显式传入 listen_all_messages=False
+    cfg = {"listen_all_messages": True}
+    cfg.update(config or {})
+    return GalleryPlugin(types.SimpleNamespace(), dict(cfg))
 
 
 async def add_pic(plugin, gall, color=(200, 30, 30)):
@@ -381,27 +403,118 @@ async def main():
         f"res={res6} sent={ev6.sent}",
     )
 
-    # ---- 4. gall 子指令权限门禁 ----
+    # ---- 4. gall 子指令权限门禁（open/alias add 对所有用户开放） ----
     plugin3 = make_plugin()
     plugin3.gallery_manager.ensure_loaded()
 
     ev7 = MockEvent("gall open 新画廊", admin=False)
     res7 = await run_handler(plugin3, ev7)
     r.check(
-        "非管理员 open 被拒绝",
-        len(res7) == 1 and res7[0][0] == "plain" and "仅限管理员" in res7[0][1],
+        "普通用户 open 创建画廊成功",
+        len(res7) == 1 and "创建成功" in res7[0][1],
         f"res={res7}",
     )
-    r.check("拒绝后停止传播", ev7.stopped is True)
-    r.check("画廊未创建", "新画廊" not in plugin3.gallery_manager.galleries)
+    r.check("创建后停止传播", ev7.stopped is True)
+    r.check("画廊已创建", "新画廊" in plugin3.gallery_manager.galleries)
 
-    ev8 = MockEvent("/gall open 新画廊", admin=True)
+    ev8 = MockEvent("/gall open 画廊二", admin=True)
     res8 = await run_handler(plugin3, ev8)
     r.check(
         "管理员 /gall open 创建成功",
-        "新画廊" in plugin3.gallery_manager.galleries
+        "画廊二" in plugin3.gallery_manager.galleries
         and any("创建成功" in x[1] for x in res8 if x[0] == "plain"),
         f"res={res8}",
+    )
+
+    # ---- 4b. alias add 用户可用 / alias del 仅管理员 / close 仅管理员 ----
+    ev_a1 = MockEvent("gall alias add 新画廊 mk", admin=False)
+    res_a1 = await run_handler(plugin3, ev_a1)
+    r.check(
+        "普通用户 alias add 成功",
+        len(res_a1) == 1 and "添加别名" in res_a1[0][1],
+        f"res={res_a1}",
+    )
+    g_mk = plugin3.gallery_manager.find_gall("mk")
+    r.check("别名已生效", g_mk is not None and g_mk.name == "新画廊")
+
+    ev_a2 = MockEvent("gall alias del 新画廊 mk", admin=False)
+    res_a2 = await run_handler(plugin3, ev_a2)
+    r.check(
+        "普通用户 alias del 被拒绝",
+        len(res_a2) == 1 and "仅限管理员" in res_a2[0][1],
+        f"res={res_a2}",
+    )
+    r.check("别名未被删除", plugin3.gallery_manager.find_gall("mk") is not None)
+
+    ev_a3 = MockEvent("gall alias del 新画廊 mk", admin=True)
+    res_a3 = await run_handler(plugin3, ev_a3)
+    r.check(
+        "管理员 alias del 成功",
+        len(res_a3) == 1 and "删除别名" in res_a3[0][1],
+        f"res={res_a3}",
+    )
+    r.check("别名已删除", plugin3.gallery_manager.find_gall("mk") is None)
+
+    ev_a4 = MockEvent("gall close 画廊二", admin=False)
+    res_a4 = await run_handler(plugin3, ev_a4)
+    r.check(
+        "普通用户 close 删除画廊被拒绝",
+        len(res_a4) == 1 and "仅限管理员" in res_a4[0][1],
+        f"res={res_a4}",
+    )
+    r.check("画廊未被删除", "画廊二" in plugin3.gallery_manager.galleries)
+
+    ev_a5 = MockEvent("gall close 画廊二", admin=True)
+    res_a5 = await run_handler(plugin3, ev_a5)
+    r.check(
+        "管理员 close 删除画廊成功",
+        len(res_a5) == 1 and "删除成功" in res_a5[0][1],
+        f"res={res_a5}",
+    )
+    r.check("画廊已删除", "画廊二" not in plugin3.gallery_manager.galleries)
+
+    # ---- 4c. 中文指令：创建画廊 / 添加别名 ----
+    ev_c1 = MockEvent("创建画廊 中文画廊", admin=False)
+    res_c1 = await run_handler(plugin3, ev_c1)
+    r.check(
+        "创建画廊 中文指令创建成功",
+        len(res_c1) == 1 and "创建成功" in res_c1[0][1]
+        and "中文画廊" in plugin3.gallery_manager.galleries,
+        f"res={res_c1}",
+    )
+
+    # "添加别名" 不能被前缀匹配成 "添加"(上传指令)
+    ev_c2 = MockEvent("添加别名 中文画廊 mk别名", admin=False)
+    res_c2 = await run_handler(plugin3, ev_c2)
+    r.check(
+        "添加别名 中文指令成功",
+        len(res_c2) == 1 and "添加别名" in res_c2[0][1]
+        and plugin3.gallery_manager.find_gall("mk别名") is not None,
+        f"res={res_c2}",
+    )
+
+    # 原生注册路径（模拟 AstrBot CommandFilter 命中后调用）
+    ev_c3 = MockEvent("创建画廊 原生中文", wake=True)
+    await run_native(plugin3, ev_c3, "cmd_open_native")
+    r.check(
+        "原生 创建画廊 成功",
+        "原生中文" in plugin3.gallery_manager.galleries,
+        f"sent={ev_c3.sent}",
+    )
+    ev_c4 = MockEvent("添加别名 原生中文 mk2", wake=True)
+    await run_native(plugin3, ev_c4, "cmd_alias_add_native")
+    r.check(
+        "原生 添加别名 成功",
+        plugin3.gallery_manager.find_gall("mk2") is not None,
+        f"sent={ev_c4.sent}",
+    )
+
+    ev_c5 = MockEvent("添加别名", wake=False)
+    res_c5 = await run_handler(plugin3, ev_c5)
+    r.check(
+        "添加别名 缺参数返回使用方式",
+        len(res_c5) == 1 and "使用方式" in res_c5[0][1],
+        f"res={res_c5}",
     )
 
     # ---- 5. /gall 无参数返回帮助 ----
@@ -418,9 +531,9 @@ async def main():
     ev11 = MockEvent("下载图包")
     res11 = await run_handler(plugin3, ev11)
     r.check(
-        "下载图包 返回链接提示",
-        len(res11) == 1 and res11[0][0] == "plain" and "分享链接" in res11[0][1],
-        f"res={res11}",
+        "下载图包 已移除，消息放行",
+        len(res11) == 0 and ev11.stopped is False,
+        f"res={res11} stopped={ev11.stopped}",
     )
 
     # ---- 7. 错误指令的使用提示 ----
@@ -431,7 +544,7 @@ async def main():
         len(res12) == 1 and "使用方式" in res12[0][1],
     )
 
-    # ---- 7b. 画廊不存在：静默放行，不回复也不拦截 ----
+    # ---- 7b. 画廊不存在：查询类指令静默放行；写操作仍提示错误 ----
     ev_nf = MockEvent("看 不存在的画廊")
     res_nf = await run_handler(plugin3, ev_nf)
     r.check("看 不存在画廊 不回复", len(res_nf) == 0, f"res={res_nf}")
@@ -440,11 +553,81 @@ async def main():
     ev_nf2 = MockEvent("gall close 不存在的画廊", admin=True)
     res_nf2 = await run_handler(plugin3, ev_nf2)
     r.check(
-        "gall close 不存在画廊 不回复",
-        len(res_nf2) == 0,
+        "gall close 不存在画廊 提示错误",
+        len(res_nf2) == 1 and "不存在" in res_nf2[0][1],
         f"res={res_nf2}",
     )
     r.check("原有画廊未受影响", "新画廊" in plugin3.gallery_manager.galleries)
+
+    # 上传到不存在的画廊必须提示错误，否则表现为「完全无响应」难以排查
+    ev_nf3 = MockEvent("上传 不存在的画廊", admin=True)
+    res_nf3 = await run_handler(plugin3, ev_nf3)
+    r.check(
+        "上传 不存在画廊 提示错误",
+        len(res_nf3) == 1 and "不存在" in res_nf3[0][1],
+        f"res={res_nf3}",
+    )
+
+    # ---- 7c. 指令触发模式：原生注册为主，listen_all 开启才启用兼容监听 ----
+    print("\n[测试] 指令触发模式")
+    plugin_w = make_plugin({"listen_all_messages": False})
+    plugin_w.gallery_manager.ensure_loaded()
+    plugin_w.gallery_manager.open_gall("唤醒测试")
+    await plugin_w.gallery_manager._save()
+    await add_pic(plugin_w, "唤醒测试")
+
+    # 兼容监听关闭（默认）：on_message 不做任何事
+    ev_w1 = MockEvent("看 唤醒测试", wake=False)
+    res_w1 = await run_handler(plugin_w, ev_w1)
+    r.check(
+        "listen_all 关闭时监听器不触发",
+        len(res_w1) == 0 and ev_w1.stopped is False,
+        f"res={res_w1} stopped={ev_w1.stopped}",
+    )
+    ev_w2 = MockEvent("随便聊聊天气", wake=False)
+    res_w2 = await run_handler(plugin_w, ev_w2)
+    r.check("listen_all 关闭时普通消息放行", len(res_w2) == 0 and ev_w2.stopped is False)
+
+    # 原生指令注册：模拟 AstrBot CommandFilter 命中后调用对应 handler
+    ev_w3 = MockEvent("看 唤醒测试", wake=True)
+    await run_native(plugin_w, ev_w3, "cmd_pick_native")
+    chains_w3 = [r for r in ev_w3.sent if isinstance(r, tuple) and r[0] == "chain"]
+    r.check("原生指令 看图 触发", len(chains_w3) == 1, f"sent={ev_w3.sent}")
+    r.check("原生指令处理后停止传播", ev_w3.stopped is True)
+
+    ev_w4 = MockEvent("gall open 原生画廊", wake=True)
+    await run_native(plugin_w, ev_w4, "cmd_gall_native")
+    r.check(
+        "原生指令 gall open 创建画廊",
+        "原生画廊" in plugin_w.gallery_manager.galleries,
+        f"sent={ev_w4.sent}",
+    )
+
+    ev_w4b = MockEvent("gall alias add 唤醒测试 mk", wake=True)
+    await run_native(plugin_w, ev_w4b, "cmd_gall_native")
+    r.check(
+        "原生指令 alias add 成功",
+        plugin_w.gallery_manager.find_gall("mk") is not None,
+        f"sent={ev_w4b.sent}",
+    )
+
+    # 开启 listen_all_messages：未唤醒裸指令由 on_message 兜底（含无空格写法）
+    plugin_w2 = make_plugin()
+    plugin_w2.gallery_manager.ensure_loaded()
+    plugin_w2.gallery_manager.open_gall("唤醒测试")
+    await plugin_w2.gallery_manager._save()
+    await add_pic(plugin_w2, "唤醒测试")
+    ev_w5 = MockEvent("看唤醒测试", wake=False)
+    await run_handler(plugin_w2, ev_w5)
+    chains_w5 = [r for r in ev_w5.sent if isinstance(r, tuple) and r[0] == "chain"]
+    r.check(
+        "开启全监听后无空格裸指令触发",
+        len(chains_w5) == 1,
+        f"sent={ev_w5.sent}",
+    )
+    ev_w6 = MockEvent("随便聊聊天气", wake=False)
+    res_w6 = await run_handler(plugin_w2, ev_w6)
+    r.check("开启全监听后非指令仍放行", len(res_w6) == 0 and ev_w6.stopped is False)
 
     # ---- 8. 合并转发消息解析 ----
     print("\n[测试] 合并转发消息解析")
@@ -469,10 +652,15 @@ async def main():
     )
 
     # 单个 Node 直接出现
+    # 单个 Node 直接出现；file 指向真实本地文件才可提取
+    # （内部 hash 或不存在的路径既非 URL 也非本地文件，会被过滤）
+    from PIL import Image as _PImgN
+    node_img = os.path.join(tempfile.gettempdir(), "gallery_node_img.png")
+    _PImgN.new("RGBA", (40, 40), (9, 9, 9, 255)).save(node_img, format="PNG")
     evf2 = MockEvent("上传 合并2")
-    evf2.message_obj.message = [Comp.Node(content=[Comp.Image(file="/local/x.gif")])]
+    evf2.message_obj.message = [Comp.Node(content=[Comp.Image(file=node_img)])]
     urls2 = await plugin._extract_image_urls(evf2)
-    r.check("单个 Node 提取图片", urls2 == ["/local/x.gif"], f"urls={urls2}")
+    r.check("单个 Node 提取图片", urls2 == [node_img], f"urls={urls2}")
 
     # 8b. Forward 组件：通过 get_forward_msg API 拉取
     fwd_payload = {
@@ -536,6 +724,148 @@ async def main():
         "Reply 内嵌 Forward 解析",
         len(urls6) == 2 and all(u.startswith("http://ex.com/api") for u in urls6),
         f"urls={urls6}",
+    )
+
+    # 8c. Reply 无 chain：经 get_msg 拉取被引用消息（适配器拉取失败时的兜底）
+    evr1 = MockEvent("上传 引用1", bot_api=MockBotAPI({
+        ("get_msg", "R1"): {
+            "message_id": "R1",
+            "message": [
+                {"type": "text", "data": {"text": "看看这张"}},
+                {"type": "image", "data": {"url": "http://ex.com/r1.jpg"}},
+            ],
+        },
+    }))
+    evr1.message_obj.message = [Comp.Reply(id="R1")]
+    urls_r1 = await plugin._extract_image_urls(evr1)
+    r.check(
+        "Reply 无chain 经 get_msg 提取",
+        urls_r1 == ["http://ex.com/r1.jpg"],
+        f"urls={urls_r1}",
+    )
+
+    # Reply 有 chain 时直接用 chain，不发 API
+    evr2 = MockEvent("上传 引用2", bot_api=MockBotAPI({}))
+    evr2.message_obj.message = [
+        Comp.Reply(id="R2", chain=[Comp.Image(url="http://ex.com/r2.jpg")]),
+    ]
+    urls_r2 = await plugin._extract_image_urls(evr2)
+    r.check(
+        "Reply 有chain 直接提取不发API",
+        urls_r2 == ["http://ex.com/r2.jpg"] and len(evr2.bot.api.calls) == 0,
+        f"urls={urls_r2} calls={evr2.bot.api.calls}",
+    )
+
+    # get_msg 失败时静默返回空（不崩）
+    evr3 = MockEvent("上传 引用3")
+    evr3.bot = types.SimpleNamespace(api=_BoomAPI())
+    evr3.message_obj.message = [Comp.Reply(id="R3")]
+    try:
+        urls_r3 = await plugin._extract_image_urls(evr3)
+        r.check("get_msg 失败不崩溃", urls_r3 == [], f"urls={urls_r3}")
+    except Exception as e:
+        r.check("get_msg 失败不崩溃", False, f"异常: {e}")
+
+    # ---- 8d. 文件形式图片（File 组件） ----
+    print("\n[测试] 文件形式图片提取")
+
+    # 8d-1. Lagrange/新版适配器：File 带 name + url
+    evF1 = MockEvent("上传 文件1")
+    evF1.message_obj.message = [
+        Comp.File(name="表情.jpg", url="http://ex.com/file1.jpg"),
+        Comp.File(name="文档.pdf", url="http://ex.com/doc.pdf"),  # 非图片应跳过
+        Comp.File(name="表情2.png", url="http://ex.com/file2.png"),
+    ]
+    urls_f1 = await plugin._extract_image_urls(evF1)
+    r.check(
+        "File 组件按扩展名提取图片",
+        urls_f1 == ["http://ex.com/file1.jpg", "http://ex.com/file2.png"],
+        f"urls={urls_f1}",
+    )
+
+    # 8d-2. File 带本地路径（file_ 字段）
+    file_img = os.path.join(tempfile.gettempdir(), "gallery_file_upload.png")
+    from PIL import Image as _PImgF
+    _PImgF.new("RGBA", (40, 40), (30, 20, 10, 255)).save(file_img, format="PNG")
+    evF2 = MockEvent("上传 文件2")
+    evF2.message_obj.message = [Comp.File(name="图.png", file_=file_img)]
+    urls_f2 = await plugin._extract_image_urls(evF2)
+    r.check("File file_ 本地路径提取", urls_f2 == [file_img], f"urls={urls_f2}")
+
+    # 8d-3. 旧版 File：file 是内部 hash、无 url → 经 get_group_file_url 换链接
+    evF3 = MockEvent("上传 文件3", bot_api=MockBotAPI({
+        "get_group_file_url": {"url": "http://ex.com/gf1.gif"},
+    }))
+    evF3.get_group_id = lambda: "12345"  # MockEvent 默认私聊，改为群聊
+    evF3.message_obj.message = [Comp.File(name="梗.gif", file="ABC123.hash", id="FID1")]
+    urls_f3 = await plugin._extract_image_urls(evF3)
+    r.check(
+        "旧版 File 经 get_group_file_url 解析",
+        urls_f3 == ["http://ex.com/gf1.gif"],
+        f"urls={urls_f3}",
+    )
+    r.check(
+        "get_group_file_url 参数正确",
+        any(a == "get_group_file_url"
+            and k.get("file_id") == "FID1" and k.get("group_id") == 12345
+            for a, k in evF3.bot.api.calls),
+        f"calls={evF3.bot.api.calls}",
+    )
+
+    # 8d-4. 新版 File 仅有 get_file() 方法（旧签名，无 allow_return_url）
+    class _FileLike(Comp.File):
+        name = "表情.webp"
+
+        async def get_file(self):
+            return file_img
+    evF4 = MockEvent("上传 文件4")
+    evF4.message_obj.message = [_FileLike()]
+    urls_f4 = await plugin._extract_image_urls(evF4)
+    r.check("File.get_file() 兜底解析", urls_f4 == [file_img], f"urls={urls_f4}")
+
+    # 8d-5. 转发消息里的 file segment（raw 层解析）
+    fwd_file_payload = {
+        "messages": [
+            {"content": [
+                {"type": "file", "data": {
+                    "url": "http://ex.com/fwfile.jpg", "file_name": "a.jpg"}},
+                # 无 url 时经 file_id 解析
+                {"type": "file", "data": {"file_id": "FID2", "file_name": "b.png"}},
+            ]},
+            {"content": [
+                {"type": "file", "data": {"file_id": "FID3", "file_name": "readme.txt"}},
+            ]},
+        ]
+    }
+    evF5 = MockEvent("上传 文件5", bot_api=MockBotAPI({
+        ("get_forward_msg", "FWDF"): fwd_file_payload,
+        "get_group_file_url": {"url": "http://ex.com/fid2.png"},
+    }))
+    evF5.get_group_id = lambda: "12345"
+    evF5.message_obj.message = [Comp.Forward(id="FWDF")]
+    urls_f5 = await plugin._extract_image_urls(evF5)
+    r.check(
+        "转发内 file segment 提取(含API兜底/非图片过滤)",
+        urls_f5 == ["http://ex.com/fwfile.jpg", "http://ex.com/fid2.png"],
+        f"urls={urls_f5}",
+    )
+
+    # 8d-6. 引用消息里的 file segment（get_msg 兜底链路）
+    evF6 = MockEvent("上传 文件6", bot_api=MockBotAPI({
+        ("get_msg", "RF1"): {
+            "message_id": "RF1",
+            "message": [
+                {"type": "file", "data": {
+                    "url": "http://ex.com/rfile.png", "file_name": "c.png"}},
+            ],
+        },
+    }))
+    evF6.message_obj.message = [Comp.Reply(id="RF1")]
+    urls_f6 = await plugin._extract_image_urls(evF6)
+    r.check(
+        "Reply 引用 file segment 提取",
+        urls_f6 == ["http://ex.com/rfile.png"],
+        f"urls={urls_f6}",
     )
 
     ok = r.summary()
@@ -645,6 +975,126 @@ async def main():
             getattr(im6, "n_frames", 1) == 3 and getattr(im6, "is_animated", False),
             f"frames={getattr(im6, 'n_frames', 1)} fmt={im6.format}",
         )
+
+    # 静态图经 sub_type=1 转为 gif 后，落库扩展名必须与内容一致（.gif）
+    plugin7 = make_plugin()
+    plugin7.gallery_manager.ensure_loaded()
+    plugin7.gallery_manager.open_gall("静图")
+    await plugin7.gallery_manager._save()
+    static_png = os.path.join(_tf.gettempdir(), "gallery_static_upload.png")
+    _PImg2.new("RGBA", (60, 60), (10, 100, 200, 255)).save(static_png, format="PNG")
+    ev_s = MockEvent("上传 静图")
+    ev_s.message_obj.message = [Comp.Image(file=static_png)]
+    await run_handler(plugin7, ev_s)
+    pics7 = plugin7.gallery_manager.galleries["静图"].pics
+    r.check("静态图上传成功", len(pics7) == 1, f"pics={len(pics7)}")
+    if pics7:
+        im7 = _PImg2.open(pics7[0].path)
+        r.check(
+            "静态图转gif后扩展名对齐",
+            pics7[0].file.lower().endswith(".gif") and im7.format == "GIF",
+            f"file={pics7[0].file} fmt={im7.format}",
+        )
+
+    # ---- 11. 引用图片上传端到端（NapCat 真实形态）----
+    print("\n[测试] 引用图片上传端到端")
+    import io as _io
+
+    def _png_bytes(color):
+        buf = _io.BytesIO()
+        _PImg2.new("RGBA", (30, 30), color + (255,)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    _url_to_bytes["http://ex.com/e2e1.jpg"] = _png_bytes((1, 2, 3))
+    _url_to_bytes["http://ex.com/e2e2.jpg"] = _png_bytes((4, 5, 6))
+
+    def _png_bytes_sized(color, size):
+        buf = _io.BytesIO()
+        _PImg2.new("RGBA", size, color + (255,)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    # 纯色小图感知哈希相同会被判重，11d 用不同尺寸与颜色
+    _url_to_bytes["http://ex.com/e2e3.jpg"] = _png_bytes_sized((200, 100, 50), (60, 40))
+
+    # 11a. 适配器已填充 chain：回复图片 + 上传
+    plugin8 = make_plugin()
+    plugin8.gallery_manager.ensure_loaded()
+    plugin8.gallery_manager.open_gall("引用传")
+    await plugin8.gallery_manager._save()
+    ev_e1 = MockEvent("上传 引用传")
+    ev_e1.message_obj.message = [
+        Comp.Reply(id="E1", chain=[Comp.Image(url="http://ex.com/e2e1.jpg")]),
+    ]
+    await run_handler(plugin8, ev_e1)
+    r.check(
+        "回复图片(chain)上传成功",
+        len(plugin8.gallery_manager.galleries["引用传"].pics) == 1,
+        f"pics={len(plugin8.gallery_manager.galleries['引用传'].pics)}",
+    )
+
+    # 11b. 适配器未填充 chain：经 get_msg 兜底后上传
+    plugin9 = make_plugin()
+    plugin9.gallery_manager.ensure_loaded()
+    plugin9.gallery_manager.open_gall("引用传2")
+    await plugin9.gallery_manager._save()
+    ev_e2 = MockEvent("上传 引用传2", bot_api=MockBotAPI({
+        ("get_msg", "E2"): {
+            "message_id": "E2",
+            "message": [
+                {"type": "image", "data": {"url": "http://ex.com/e2e2.jpg"}},
+            ],
+        },
+    }))
+    ev_e2.message_obj.message = [Comp.Reply(id="E2")]
+    await run_handler(plugin9, ev_e2)
+    r.check(
+        "回复图片(无chain兜底)上传成功",
+        len(plugin9.gallery_manager.galleries["引用传2"].pics) == 1,
+        f"pics={len(plugin9.gallery_manager.galleries['引用传2'].pics)}",
+    )
+
+    # 11c. chain 里的 Image 丢了 url/file（NapCat 部分版本行为）：
+    # chain 提取不到时必须回退 get_msg 拉原始 segment
+    plugin10 = make_plugin()
+    plugin10.gallery_manager.ensure_loaded()
+    plugin10.gallery_manager.open_gall("引用传3")
+    await plugin10.gallery_manager._save()
+    ev_e3 = MockEvent("上传 引用传3", bot_api=MockBotAPI({
+        ("get_msg", "E3"): {
+            "message_id": "E3",
+            "message": [
+                {"type": "image", "data": {"url": "http://ex.com/e2e1.jpg"}},
+            ],
+        },
+    }))
+    ev_e3.message_obj.message = [
+        Comp.Reply(id="E3", chain=[Comp.Image(file="", url="")]),  # 字段全空
+    ]
+    await run_handler(plugin10, ev_e3)
+    r.check(
+        "chain字段全空时回退get_msg上传成功",
+        len(plugin10.gallery_manager.galleries["引用传3"].pics) == 1,
+        f"pics={len(plugin10.gallery_manager.galleries['引用传3'].pics)}",
+    )
+
+    # 11d. file 为 NapCat 内部 hash（"ABC.image"，既非路径也非URL）不应直接当 URL 下载
+    ev_e4 = MockEvent("上传 引用传3", bot_api=MockBotAPI({
+        ("get_msg", "E4"): {
+            "message_id": "E4",
+            "message": [
+                {"type": "image", "data": {"url": "http://ex.com/e2e3.jpg"}},
+            ],
+        },
+    }))
+    ev_e4.message_obj.message = [
+        Comp.Reply(id="E4", chain=[Comp.Image(file="ABC123.image", url="")]),
+    ]
+    await run_handler(plugin10, ev_e4)
+    r.check(
+        "file为内部hash时回退get_msg上传成功",
+        len(plugin10.gallery_manager.galleries["引用传3"].pics) == 2,
+        f"pics={len(plugin10.gallery_manager.galleries['引用传3'].pics)}",
+    )
 
     ok2 = r.summary()
     sys.exit(0 if ok and ok2 else 1)

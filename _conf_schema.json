@@ -33,38 +33,12 @@
     "description": "是否兼容 / 前缀。开启时 /看 与 看 都生效；关闭时仅接受不带 / 的裸指令",
     "type": "bool",
     "default": true,
-    "hint": "始终监听所有消息：开启时同时接受 /看 和 看；关闭时只接受 看"
+    "hint": "对被唤醒(@机器人/唤醒前缀)的消息生效"
   },
-  "sync": {
-    "description": "百度网盘同步设置(需服务器已安装 bypy 并完成授权)",
-    "type": "object",
-    "hint": "通过 bypy 命令行工具定时上传画廊图片到百度网盘",
-    "items": {
-      "enable": {
-        "description": "是否启用百度网盘同步",
-        "type": "bool",
-        "default": false
-      },
-      "sync_times": {
-        "description": "同步时间点列表，每项为 [时, 分, 秒]",
-        "type": "list",
-        "default": [[3, 30, 0]]
-      },
-      "verbose": {
-        "description": "是否输出 bypy 详细日志",
-        "type": "bool",
-        "default": true
-      },
-      "remote_dir": {
-        "description": "百度网盘远端目录名",
-        "type": "string",
-        "default": "AstrBotGallery"
-      },
-      "share_link": {
-        "description": "图包分享链接(/下载图包 返回此链接)",
-        "type": "string",
-        "default": ""
-      }
-    }
+  "listen_all_messages": {
+    "description": "允许监听所有消息（免唤醒）",
+    "type": "bool",
+    "default": false,
+    "hint": "默认指令走 AstrBot 原生注册，需 @机器人/唤醒前缀/私聊触发；开启后额外监听所有消息，未唤醒的群消息也能用裸指令触发（含 看miku 无空格写法）"
   }
 }

@@ -1,6 +1,8 @@
 """AstrBot 画廊插件主入口。
 
-移植自 lunabot 的画廊服务。监听所有消息，指令兼容 / 前缀但也允许不带 /。
+移植自 lunabot 的画廊服务。指令通过 @filter.command 以 AstrBot 原生方式
+注册，由 @机器人 / 唤醒前缀 / 私聊触发；配置开启 listen_all_messages 后
+额外监听所有消息，未唤醒的裸指令（含无空格写法）也能触发。
 持久化数据存放于 data/plugin_data/astrbot_plugin_gallery/。
 """
 
@@ -10,8 +12,7 @@ import asyncio
 import os
 import re
 import shutil
-import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger, AstrBotConfig
@@ -21,7 +22,6 @@ from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.io import download_image_by_url
 
 from .gallery_manager import (
-    Gallery,
     GalleryManager,
     GalleryMode,
     GalleryPic,
@@ -32,6 +32,9 @@ from .gallery_manager import (
 from .history import HistoryManager
 from . import image_utils
 from .image_utils import ImageProcessor, process_image_for_gallery
+
+# "以文件方式发送"的图片按扩展名识别：文件名/路径/链接带这些扩展名才尝试提取
+IMAGE_FILE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
 @register(
@@ -59,7 +62,6 @@ class GalleryPlugin(Star):
         )
         self.gallery_manager = GalleryManager(self.data_dir, self.img_proc)
         self.history_manager = HistoryManager(self.data_dir, self.gallery_manager)
-        self._sync_task: asyncio.Task | None = None
 
     def _read_config(self) -> None:
         """从 AstrBotConfig 读取配置项。"""
@@ -71,28 +73,16 @@ class GalleryPlugin(Star):
             self.config.get("user_recent_revert_expired_hours", 24)
         )
         self.enable_slash_prefix = bool(self.config.get("enable_slash_prefix", True))
-        sync = self.config.get("sync", {}) or {}
-        self.sync_enable = bool(sync.get("enable", False))
-        self.sync_times = sync.get("sync_times", [[3, 30, 0]]) or []
-        self.sync_verbose = bool(sync.get("verbose", True))
-        self.sync_remote_dir = sync.get("remote_dir", "AstrBotGallery") or "AstrBotGallery"
-        self.share_link = sync.get("share_link", "") or ""
+        self.listen_all_messages = bool(
+            self.config.get("listen_all_messages", False)
+        )
 
     async def initialize(self):
-        """插件初始化：加载数据、启动同步任务。"""
+        """插件初始化：加载数据。"""
         self.gallery_manager.ensure_loaded()
         self.history_manager.ensure_loaded()
-        if self.sync_enable and self.sync_times:
-            self._sync_task = asyncio.create_task(self._sync_loop())
-            logger.info("画廊百度网盘同步任务已启动")
 
     async def terminate(self):
-        if self._sync_task and not self._sync_task.done():
-            self._sync_task.cancel()
-            try:
-                await self._sync_task
-            except asyncio.CancelledError:
-                pass
         logger.info("画廊插件已停止")
 
     # ==================== 指令路由 ====================
@@ -100,12 +90,84 @@ class GalleryPlugin(Star):
     # 画廊不存在错误文案（画廊名不允许含引号，此匹配不会误伤其他错误）
     _GALL_NOT_FOUND_RE = re.compile(r'画廊".+"不存在')
 
+    # ---- AstrBot 原生指令注册（主要使用方式）----
+    # 通过 @机器人 / 唤醒前缀(如 /) / 私聊触发，由 AstrBot 唤醒与指令系统接管。
+    # 原生指令要求指令名后有空格（AstrBot CommandFilter 限制），
+    # "看miku"这类无空格裸指令由下方 on_message 在 listen_all_messages
+    # 开启时兜底。所有指令的实际处理统一走 _handle_cmd。
+    # 注意：原生指令 handler 必须定义在 on_message 之前——AstrBot 按
+    # 注册顺序执行 handler，先处理并 stop_event 可避免兼容监听器重复响应。
+
+    @filter.command("看")
+    async def cmd_pick_native(self, event: AstrMessageEvent):
+        """看画廊图片：看 画廊名 [x数量|-序号] 或 看 图片pid..."""
+        async for r in self._handle_cmd(event):
+            yield r
+
+    @filter.command("看所有", alias={"看全部"})
+    async def cmd_list_native(self, event: AstrMessageEvent):
+        """查看所有画廊列表，或指定画廊的图片网格"""
+        async for r in self._handle_cmd(event):
+            yield r
+
+    @filter.command("上传", alias={"添加"})
+    async def cmd_add_native(self, event: AstrMessageEvent):
+        """上传图片到画廊：上传 画廊名 [force]（回复/附带图片，支持文件形式）"""
+        async for r in self._handle_cmd(event):
+            yield r
+
+    @filter.command("取消上传", alias={"撤销上传", "回退上传"})
+    async def cmd_cancel_native(self, event: AstrMessageEvent):
+        """撤销最近一次上传；管理员可加记录ID撤销指定记录"""
+        async for r in self._handle_cmd(event):
+            yield r
+
+    @filter.command("上传记录")
+    async def cmd_record_native(self, event: AstrMessageEvent):
+        """查看指定上传记录：上传记录 记录ID"""
+        async for r in self._handle_cmd(event):
+            yield r
+
+    @filter.command("创建画廊")
+    async def cmd_open_native(self, event: AstrMessageEvent):
+        """创建画廊：创建画廊 画廊名（默认允许上传）"""
+        async for r in self._handle_cmd(event):
+            yield r
+
+    @filter.command("添加别名")
+    async def cmd_alias_add_native(self, event: AstrMessageEvent):
+        """添加画廊别名：添加别名 画廊名 别名"""
+        async for r in self._handle_cmd(event):
+            yield r
+
+    @filter.command("gall")
+    async def cmd_gall_native(self, event: AstrMessageEvent):
+        """画廊管理：open/close/alias/mode/cover/del/replace/reload/check/log"""
+        async for r in self._handle_cmd(event):
+            yield r
+
+    # ---- 全消息监听（兼容模式，仅 listen_all_messages 开启时生效）----
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """监听所有消息，分发画廊指令。兼容 / 前缀，也允许不带 /。
+        """监听所有消息的兼容模式。
 
-        说明：AstrBot 的 message_str 通常已剥离平台唤醒前缀，因此这里再处理
-        一次开头可选的 /，保证 /看 与 看 都能触发。
+        仅当配置 listen_all_messages=True（允许监听所有消息）时启用：
+        未唤醒的群消息里的裸指令（如直接发 看表情包、看miku 无空格写法）
+        也会触发画廊指令。默认关闭时此监听器不做任何事，指令统一走
+        上面的原生注册。唤醒消息会先被原生指令处理并停止传播，不会
+        在这里重复响应。
+        """
+        if not self.listen_all_messages:
+            return
+        async for r in self._handle_cmd(event):
+            yield r
+
+    async def _handle_cmd(self, event: AstrMessageEvent):
+        """解析消息并分发画廊指令（原生指令与兼容监听器共用）。
+
+        AstrBot 的 message_str 已剥离唤醒前缀，这里再处理开头可选的 /，
+        保证 /看 与 看 都能触发。
         enable_slash_prefix=True(默认): /看 与 看 都生效；
         enable_slash_prefix=False: 仅接受不带 / 的裸指令。
         """
@@ -128,15 +190,24 @@ class GalleryPlugin(Star):
         if not parsed:
             return
         cmd, args = parsed
+        # 排查用：消息到达插件并匹配到画廊指令时必有此日志。
+        # 若发了指令但日志中无此行，说明消息未到达插件（唤醒/连接/被其他插件拦截）。
+        logger.info(
+            f"画廊指令触发: [{cmd}] {args} (platform={event.get_platform_name()}, "
+            f"session={event.unified_msg_origin})"
+        )
 
         # 匹配到画廊指令，处理后停止事件传播（避免继续触发 LLM 等）
         try:
             async for result in self._dispatch(event, cmd, args):
                 yield result
         except ReplyException as e:
-            if self._GALL_NOT_FOUND_RE.fullmatch(str(e)):
-                # 画廊不存在：视为误触发，不回复也不拦截，放行给其他插件/LLM
+            if cmd in ("看", "看所有", "看全部") and self._GALL_NOT_FOUND_RE.fullmatch(
+                str(e)
+            ):
+                # 查询类指令遇画廊不存在：多为普通聊天误触发，静默放行不拦截
                 return
+            # 写操作（上传/gall 等）必须提示错误，否则表现为无响应难以排查
             yield event.plain_result(str(e))
         except GalleryPicRepeatedException as e:
             yield event.plain_result(str(e))
@@ -152,7 +223,9 @@ class GalleryPlugin(Star):
         "看所有", "看全部",
         "取消上传", "撤销上传", "回退上传",
         "上传记录",
-        "下载图包", "下载看", "下载画廊",
+        "创建画廊",
+        # "添加别名" 必须排在 "添加" 前面，否则会被前缀匹配成上传指令
+        "添加别名",
         "上传", "添加",
         "看",
         "gall",
@@ -173,10 +246,6 @@ class GalleryPlugin(Star):
             return cmd, rest.strip()
         return None
 
-    def _is_gallery_cmd(self, cmd: str, args: str) -> bool:
-        """判断是否为画廊指令（用于决定是否拦截事件传播）。"""
-        return self._parse_cmd(f"{cmd} {args}".strip()) is not None
-
     async def _dispatch(self, event: AstrMessageEvent, cmd: str, args: str):
         """根据指令名分发到对应处理器。"""
         # 看图（普通用户）：内部直发合并消息链，不经过分段回复管线
@@ -194,8 +263,16 @@ class GalleryPlugin(Star):
         elif cmd == "上传记录":
             async for r in self._cmd_record(event, args):
                 yield r
-        elif cmd == "下载图包" or cmd == "下载看" or cmd == "下载画廊":
-            yield event.plain_result(self.share_link or "未配置图包分享链接")
+        elif cmd == "创建画廊":
+            async for r in self._gall_open(event, args):
+                yield r
+        elif cmd == "添加别名":
+            parts = args.split(None, 1)
+            if len(parts) < 2:
+                yield event.plain_result("使用方式: /添加别名 画廊名 别名")
+                return
+            async for r in self._gall_alias_add(event, parts[0], parts[1].strip()):
+                yield r
         elif cmd == "gall":
             # /gall <子指令> [参数...]
             if not args:
@@ -211,17 +288,15 @@ class GalleryPlugin(Star):
             return
 
     async def _dispatch_gall(self, event: AstrMessageEvent, sub: str, args: str):
-        """分发 /gall 子指令（管理员指令在此校验权限）。"""
+        """分发 /gall 子指令（管理员指令在此校验权限，管理员即 AstrBot
+        配置 admins_id 中的用户，可用 event.is_admin() 识别）。"""
         is_admin = event.is_admin()
 
-        # 管理员专属指令
+        # 所有用户可用：创建画廊（默认 edit 模式，允许上传）
         if sub == "open":
-            self._require_admin(is_admin)
-            name = args.strip()
-            async with self.gallery_manager._lock:
-                self.gallery_manager.open_gall(name)
-                await self.gallery_manager._save()
-            yield event.plain_result(f'画廊"{name}"创建成功')
+            async for r in self._gall_open(event, args):
+                yield r
+        # 管理员专属指令
         elif sub == "close":
             self._require_admin(is_admin)
             name = args.strip()
@@ -238,30 +313,44 @@ class GalleryPlugin(Star):
                 yield r
         elif sub == "alias":
             # /gall alias add/del 画廊名 别名
+            # 添加别名所有用户可用；删除别名仅管理员
             if not args:
-                yield event.plain_result("使用方式: /gall alias add 画廊名称 别名\n/gall alias del 画廊名称 别名")
+                yield event.plain_result(
+                    "使用方式: /gall alias add 画廊名称 别名\n"
+                    "/gall alias del 画廊名称 别名\n"
+                    "也可以用: /添加别名 画廊名 别名"
+                )
                 return
             ap = args.split(None, 2)
             if len(ap) < 2:
-                yield event.plain_result("使用方式: /gall alias add 画廊名称 别名\n/gall alias del 画廊名称 别名")
+                yield event.plain_result(
+                    "使用方式: /gall alias add 画廊名称 别名\n"
+                    "/gall alias del 画廊名称 别名\n"
+                    "也可以用: /添加别名 画廊名 别名"
+                )
                 return
             op = ap[0]
             if op not in ("add", "del", "remove"):
-                yield event.plain_result("使用方式: /gall alias add 画廊名称 别名\n/gall alias del 画廊名称 别名")
+                yield event.plain_result(
+                    "使用方式: /gall alias add 画廊名称 别名\n"
+                    "/gall alias del 画廊名称 别名\n"
+                    "也可以用: /添加别名 画廊名 别名"
+                )
                 return
-            self._require_admin(is_admin)
+            if op != "add":
+                self._require_admin(is_admin)
             if len(ap) < 3:
                 yield event.plain_result(f"使用方式: /gall alias {op} 画廊名称 别名")
                 return
             gall_name, alias = ap[1], ap[2]
-            async with self.gallery_manager._lock:
-                if op == "add":
-                    self.gallery_manager.add_gall_alias(gall_name, alias)
-                    yield event.plain_result(f'画廊"{gall_name}"添加别名"{alias}"成功')
-                else:
+            if op == "add":
+                async for r in self._gall_alias_add(event, gall_name, alias):
+                    yield r
+            else:
+                async with self.gallery_manager._lock:
                     self.gallery_manager.del_gall_alias(gall_name, alias)
                     yield event.plain_result(f'画廊"{gall_name}"删除别名"{alias}"成功')
-                await self.gallery_manager._save()
+                    await self.gallery_manager._save()
         elif sub == "del" or sub == "remove":
             self._require_admin(is_admin)
             async for r in self._gall_del(event, args):
@@ -285,10 +374,6 @@ class GalleryPlugin(Star):
             self._require_admin(is_admin)
             async for r in self._gall_replace(event, args):
                 yield r
-        elif sub == "download":
-            self._require_admin(is_admin)
-            async for r in self._gall_download(event, args):
-                yield r
         elif sub == "cancel" or sub == "revert":
             async for r in self._cmd_cancel(event, args):
                 yield r
@@ -310,7 +395,9 @@ class GalleryPlugin(Star):
     @staticmethod
     def _require_admin(is_admin: bool) -> None:
         if not is_admin:
-            raise ReplyException("该指令仅限管理员使用")
+            raise ReplyException(
+                "该指令仅限管理员使用（管理员在 AstrBot 配置的 admins_id 中设置）"
+            )
 
     def _gall_help(self) -> str:
         return (
@@ -318,12 +405,14 @@ class GalleryPlugin(Star):
             "看图: /看 画廊名 | /看 画廊名 x2 | /看 画廊名 -1 | /看 123 456\n"
             "画廊列表: /看所有 | /看所有 画廊名\n"
             "上传: (回复图片) /上传 画廊名 [force]\n"
+            "  (支持附带/回复/转发里的图片，图片也可用文件形式发送)\n"
+            "创建画廊: /创建画廊 画廊名 (或 /gall open 画廊名)\n"
+            "添加别名: /添加别名 画廊名 别名 (或 /gall alias add 画廊名 别名)\n"
             "撤销: /取消上传 [记录ID(管理员)]\n"
             "记录: /上传记录 记录ID\n"
-            "图包链接: /下载图包\n"
-            "管理员(/gall 子指令):\n"
-            "  open/close/mode/cover/alias add|del\n"
-            "  del/reload/check/log/replace/download"
+            "管理员(/gall 子指令，管理员在 AstrBot 配置 admins_id 中设置):\n"
+            "  close 删除画廊 | del 删图 | replace 换图 | reload/check/log\n"
+            "  mode 模式 | cover 封面 | alias del 删别名"
         )
 
     # ==================== 指令实现 ====================
@@ -492,6 +581,9 @@ class GalleryPlugin(Star):
                 await asyncio.to_thread(
                     process_image_for_gallery, path, 1, self.size_limit_mb
                 )
+                # 处理可能转换了格式（静态图转 gif），对齐扩展名避免 QQ 按后缀误判
+                path = await asyncio.to_thread(self._fix_ext_by_format, path)
+                paths[i - 1] = path  # 同步回列表，保证清理阶段能删除
                 pid = await self.gallery_manager.async_add_pic(
                     name,
                     path,
@@ -618,6 +710,21 @@ class GalleryPlugin(Star):
             img_path = await image_utils.render_pic_grid(items, self.tmp_dir)
             chain.append(Comp.Image.fromFileSystem(img_path))
         yield event.chain_result(chain)
+
+    async def _gall_open(self, event: AstrMessageEvent, args: str):
+        """创建画廊（所有用户可用，默认 edit 模式，允许上传）。"""
+        name = args.strip()
+        async with self.gallery_manager._lock:
+            self.gallery_manager.open_gall(name)
+            await self.gallery_manager._save()
+        yield event.plain_result(f'画廊"{name}"创建成功')
+
+    async def _gall_alias_add(self, event: AstrMessageEvent, gall_name: str, alias: str):
+        """添加画廊别名（所有用户可用）。"""
+        async with self.gallery_manager._lock:
+            self.gallery_manager.add_gall_alias(gall_name, alias)
+            yield event.plain_result(f'画廊"{gall_name}"添加别名"{alias}"成功')
+            await self.gallery_manager._save()
 
     async def _gall_mode(self, event: AstrMessageEvent, args: str, is_admin: bool):
         """查看或设置画廊模式。"""
@@ -784,7 +891,10 @@ class GalleryPlugin(Star):
         if not local or not os.path.exists(local):
             raise ReplyException("获取图片失败")
         try:
-            await asyncio.to_thread(process_image_for_gallery, local, 1, self.size_limit_mb)
+            await asyncio.to_thread(
+                process_image_for_gallery, local, 1, self.size_limit_mb
+            )
+            local = await asyncio.to_thread(self._fix_ext_by_format, local)
             pid = await self.gallery_manager.async_replace_pic(
                 pid,
                 local,
@@ -803,66 +913,20 @@ class GalleryPlugin(Star):
                 pass
         yield event.plain_result(f"成功替换图片pid={pid}")
 
-    async def _gall_download(self, event: AstrMessageEvent, args: str):
-        """打包下载指定画廊图片并上传群文件（仅群聊）。"""
-        name = args
-        g = self.gallery_manager.find_gall(name, raise_if_nofound=True)
-        if not g.pics:
-            raise ReplyException(f'画廊"{name}"没有图片')
-
-        group_id = event.get_group_id()
-        if not group_id:
-            raise ReplyException("该指令仅在群聊中可用")
-
-        # 打包 zip 到临时目录
-        zip_path = os.path.join(self.tmp_dir, f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
-        await asyncio.to_thread(self._zip_gallery, g, zip_path)
-        filesize = os.path.getsize(zip_path) / (1024 * 1024)
-        await event.send(
-            event.plain_result(
-                f'正在发送画廊"{name}"所有{len(g.pics)}张图片的压缩包({filesize:.2f}M)...'
-            )
-        )
-        try:
-            # 通过平台适配器上传群文件
-            await self._upload_group_file(event, group_id, zip_path, os.path.basename(zip_path))
-        finally:
-            try:
-                os.remove(zip_path)
-            except OSError:
-                pass
-
-    def _zip_gallery(self, g: Gallery, zip_path: str) -> None:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for pic in g.pics:
-                if os.path.exists(pic.path):
-                    arcname = os.path.basename(pic.path)
-                    zipf.write(pic.path, arcname)
-
-    async def _upload_group_file(
-        self, event: AstrMessageEvent, group_id: str, file_path: str, file_name: str
-    ) -> None:
-        """通过平台适配器上传群文件（aiocqhttp）。"""
-        try:
-            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
-                AiocqhttpMessageEvent,
-            )
-            if not isinstance(event, AiocqhttpMessageEvent):
-                raise ReplyException("当前平台不支持上传群文件")
-            client = event.bot
-            await client.api.call_action(
-                "upload_group_file",
-                group_id=int(group_id),
-                file=file_path,
-                name=file_name,
-            )
-        except ReplyException:
-            raise
-        except Exception as e:
-            logger.error(f"上传群文件失败: {get_exc_desc(e)}")
-            raise ReplyException(f"上传群文件失败: {e}")
-
     # ==================== 辅助方法 ====================
+
+    @staticmethod
+    def _is_fetchable_src(src: str | None) -> bool:
+        """判断图片来源是否可获取：网络 URL / file:// / base64 / 实际存在的本地路径。
+
+        NapCat 的 Image.file 可能是内部 hash（如 "ABC123.image"），既非路径
+        也非 URL，直接传给下载器只会报 InvalidUrl——视为无效来源。
+        """
+        if not src:
+            return False
+        if src.startswith(("http://", "https://", "file:///", "base64://")):
+            return True
+        return os.path.exists(src)
 
     async def _localize_image(self, src: str) -> str:
         """把图片来源（网络 URL / file:/// / 本地路径 / base64）统一转为本地文件路径。
@@ -940,11 +1004,18 @@ class GalleryPlugin(Star):
         """
         urls: list[str] = []
         seen_forward_ids: set[str] = set()
+        seen_reply_ids: set[str] = set()
         if not event.message_obj or not event.message_obj.message:
             return urls
 
         def image_url_of(comp) -> str | None:
-            return getattr(comp, "url", None) or getattr(comp, "file", None)
+            url = getattr(comp, "url", None)
+            if self._is_fetchable_src(url):
+                return url
+            file = getattr(comp, "file", None)
+            if self._is_fetchable_src(file):
+                return file
+            return None
 
         async def walk(comps: list, depth: int):
             if depth > 4:
@@ -955,10 +1026,26 @@ class GalleryPlugin(Star):
                         url = image_url_of(comp)
                         if url:
                             urls.append(url)
+                    elif isinstance(comp, Comp.File):
+                        # QQ"以文件方式发送"的图片以 File 组件到达
+                        src = await self._src_of_file_comp(event, comp)
+                        if src:
+                            urls.append(src)
                     elif isinstance(comp, Comp.Reply):
+                        rid = getattr(comp, "id", None)
                         chain = getattr(comp, "chain", None)
+                        before = len(urls)
                         if chain:
                             await walk(chain, depth + 1)
+                        if len(urls) == before and rid and str(rid) not in seen_reply_ids:
+                            # chain 缺失、或其中图片字段不全（NapCat 部分版本
+                            # 不给 url、file 只是内部 hash）时，回退 get_msg
+                            # 拉取被引用消息的原始 segment
+                            seen_reply_ids.add(str(rid))
+                            segments = await self._fetch_reply_segments(event, rid)
+                            urls.extend(
+                                await self._urls_from_raw_segments(event, segments)
+                            )
                     elif isinstance(comp, Comp.Node):
                         content = getattr(comp, "content", None)
                         if content:
@@ -974,7 +1061,9 @@ class GalleryPlugin(Star):
                             continue
                         seen_forward_ids.add(str(fid))
                         segments = await self._fetch_forward_segments(event, fid)
-                        urls.extend(self._urls_from_raw_segments(segments))
+                        urls.extend(
+                            await self._urls_from_raw_segments(event, segments)
+                        )
                 except Exception as e:
                     logger.warning(f"提取图片组件失败: {get_exc_desc(e)}")
 
@@ -1034,8 +1123,109 @@ class GalleryPlugin(Star):
         collect(res)
         return flat
 
+    async def _fetch_reply_segments(self, event: AstrMessageEvent, reply_id) -> list:
+        """通过 aiocqhttp 的 get_msg API 拉取被引用消息内容（原始 segment 字典列表）。
+
+        用于 Reply 组件未携带 chain 的兜底场景；非 aiocqhttp 平台或
+        API 失败时返回空列表。
+        """
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
+
+        if not isinstance(event, AiocqhttpMessageEvent):
+            logger.debug("当前平台不支持拉取引用消息内容")
+            return []
+        client = getattr(event, "bot", None)
+        if client is None:
+            return []
+        res = None
+        candidates = [{"message_id": reply_id}]
+        if str(reply_id).isdigit():
+            candidates.append({"message_id": int(reply_id)})
+        for action_kwargs in candidates:
+            try:
+                res = await client.api.call_action("get_msg", **action_kwargs)
+                if res:
+                    break
+            except Exception as e:
+                logger.debug(f"get_msg({action_kwargs}) 失败: {get_exc_desc(e)}")
+        if not isinstance(res, dict):
+            return []
+        segs = res.get("message") or res.get("content") or []
+        if isinstance(segs, list):
+            return [s for s in segs if isinstance(s, dict)]
+        return []
+
     @staticmethod
-    def _urls_from_raw_segments(segments: list) -> list[str]:
+    def _is_image_name(name: str | None) -> bool:
+        return bool(name) and os.path.splitext(name)[1].lower() in IMAGE_FILE_EXTS
+
+    async def _src_of_file_comp(self, event: AstrMessageEvent, comp) -> str:
+        """把 File 组件解析为可获取的图片源（http URL / file:/// / 本地路径）。
+
+        QQ"以文件方式发送"的图片以 File 组件（而非 Image 组件）到达。
+        新版 AstrBot 的 File.file 是同步 property，在异步上下文里只会
+        告警并返回空串，取本地路径要用 await File.get_file()；
+        旧版 File 的 file 字段可能是 OneBot 内部 file_id（不可直接获取），
+        此时回退到协议端 API 换取下载链接。
+        """
+        if not (
+            self._is_image_name(getattr(comp, "name", None))
+            or self._is_image_name(getattr(comp, "url", None))
+            or self._is_image_name(getattr(comp, "file_", None))
+            or self._is_image_name(getattr(comp, "file", None))
+        ):
+            return ""
+        for field in ("url", "file_"):
+            src = getattr(comp, field, None)
+            if self._is_fetchable_src(src):
+                return src
+        legacy = getattr(comp, "file", None)
+        if self._is_fetchable_src(legacy):
+            return legacy
+        get_file = getattr(comp, "get_file", None)
+        if get_file is not None:
+            try:
+                src = await get_file(allow_return_url=True)
+            except TypeError:
+                src = await get_file()
+            except Exception as e:
+                logger.warning(f"获取文件消息内容失败: {get_exc_desc(e)}")
+                return ""
+            if self._is_fetchable_src(src):
+                return src
+        return await self._fetch_file_url(event, getattr(comp, "id", None))
+
+    async def _fetch_file_url(self, event: AstrMessageEvent, fid) -> str:
+        """通过 aiocqhttp 的 get_group_file_url / get_private_file_url
+        把 OneBot file_id 换成文件下载链接；失败返回空串。"""
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
+
+        if not isinstance(event, AiocqhttpMessageEvent) or not fid:
+            return ""
+        client = getattr(event, "bot", None)
+        if client is None:
+            return ""
+        group_id = event.get_group_id()
+        try:
+            if group_id:
+                res = await client.api.call_action(
+                    "get_group_file_url", file_id=fid, group_id=int(group_id)
+                )
+            else:
+                res = await client.api.call_action(
+                    "get_private_file_url", file_id=fid
+                )
+        except Exception as e:
+            logger.debug(f"获取文件下载链接(file_id={fid})失败: {get_exc_desc(e)}")
+            return ""
+        url = res.get("url") if isinstance(res, dict) else None
+        return url if self._is_fetchable_src(url) else ""
+
+    async def _urls_from_raw_segments(self, event: AstrMessageEvent, segments: list) -> list[str]:
         """从 OneBot 原始 segment 列表中提取图片 URL（含嵌套 node）。"""
         out: list[str] = []
         for seg in segments or []:
@@ -1045,11 +1235,31 @@ class GalleryPlugin(Star):
             data = seg.get("data") or {}
             if stype == "image":
                 url = data.get("url") or data.get("file")
-                if url:
+                if url and self._is_fetchable_src(url):
                     out.append(url)
+            elif stype == "file":
+                # 以文件形式随转发/引用消息传来的图片
+                name = (
+                    data.get("file_name")
+                    or data.get("name")
+                    or data.get("url")
+                    or data.get("file")
+                    or ""
+                )
+                if not self._is_image_name(name):
+                    continue
+                url = data.get("url")
+                if url and self._is_fetchable_src(url):
+                    out.append(url)
+                else:
+                    src = await self._fetch_file_url(
+                        event, data.get("file_id") or data.get("id")
+                    )
+                    if src:
+                        out.append(src)
             elif stype == "node":
                 inner = data.get("content") or data.get("message") or []
-                out.extend(GalleryPlugin._urls_from_raw_segments(inner))
+                out.extend(await self._urls_from_raw_segments(event, inner))
         return out
 
     async def _append_add_log(self, user_id: str, pid: int, gallery_name: str) -> None:
@@ -1064,99 +1274,3 @@ class GalleryPlugin(Star):
                 )
 
         await asyncio.to_thread(write_log)
-
-    # ==================== 百度网盘同步 ====================
-
-    async def _sync_loop(self) -> None:
-        """定时同步画廊到百度网盘。
-
-        使用 bypy 命令行工具，按配置的 sync_times 定时执行。
-        """
-        import subprocess
-
-        while True:
-            try:
-                # 计算下一次同步时间
-                now = datetime.now()
-                next_time = self._calc_next_sync(now)
-                wait_seconds = (next_time - now).total_seconds()
-                if wait_seconds > 0:
-                    await asyncio.sleep(wait_seconds)
-                await self._do_sync()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"画廊同步循环出错: {get_exc_desc(e)}")
-                await asyncio.sleep(60)
-
-    def _calc_next_sync(self, now: datetime) -> datetime:
-        """计算下一次同步时间点。"""
-        candidates = []
-        for t in self.sync_times:
-            try:
-                h, m, s = int(t[0]), int(t[1]), int(t[2])
-                target = now.replace(hour=h, minute=m, second=s, microsecond=0)
-                if target <= now:
-                    # 已过今日该时间点，顺延到明天
-                    target = target + timedelta(days=1)
-                candidates.append(target)
-            except Exception:
-                continue
-        if not candidates:
-            # 默认每天 3:30
-            target = now.replace(hour=3, minute=30, second=0, microsecond=0)
-            if target <= now:
-                target = target + timedelta(days=1)
-            return target
-        return min(candidates)
-
-    async def _do_sync(self) -> None:
-        """执行一次同步：把每个画廊图片拷到临时目录，调用 bypy syncup。"""
-        import subprocess
-
-        local_dir = os.path.join(self.tmp_dir, "sync")
-        for name, g in self.gallery_manager.get_all_galls().items():
-            try:
-                logger.info(f'开始同步画廊"{name}"到百度网盘({self.sync_remote_dir})')
-                gall_local = os.path.join(local_dir, name)
-                os.makedirs(gall_local, exist_ok=True)
-                for p in g.pics:
-                    if os.path.exists(p.path):
-                        _, ext = os.path.splitext(os.path.basename(p.path))
-                        dst = os.path.join(gall_local, f"{p.pid}{ext}")
-                        await asyncio.to_thread(shutil.copy2, p.path, dst)
-
-                command = [
-                    "bypy",
-                    "syncup",
-                    gall_local,
-                    os.path.join(self.sync_remote_dir, name),
-                    "True",
-                    "-v",
-                ]
-                process = await asyncio.to_thread(
-                    subprocess.Popen,
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                )
-                while True:
-                    output = await asyncio.to_thread(process.stdout.readline)
-                    if output == "" and process.poll() is not None:
-                        break
-                    if output and self.sync_verbose:
-                        logger.info(f"[bypy] {output.strip()}")
-                if process.returncode != 0:
-                    raise Exception(f"bypy执行失败: code={process.returncode}")
-                logger.info(f'画廊"{name}"同步完成')
-            except Exception as e:
-                logger.error(f'同步画廊"{name}"失败: {get_exc_desc(e)}')
-            finally:
-                # 清理当前画廊的临时目录
-                try:
-                    if os.path.isdir(gall_local):
-                        shutil.rmtree(gall_local, ignore_errors=True)
-                except Exception:
-                    pass
