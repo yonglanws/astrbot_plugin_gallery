@@ -12,6 +12,7 @@ import asyncio
 import os
 import re
 import shutil
+import uuid
 from datetime import datetime
 
 import astrbot.api.message_components as Comp
@@ -947,7 +948,11 @@ class GalleryPlugin(Star):
         if src.startswith("base64://"):
             import base64 as _b64
             data = _b64.b64decode(src[9:])
-            dst = os.path.join(self.tmp_dir, f"imgseg_{datetime.now().strftime('%Y%m%d%H%M%S%f')}")
+            # uuid 后缀避免并发本地化时微秒时间戳撞名（Windows 时钟精度不足）
+            dst = os.path.join(
+                self.tmp_dir,
+                f"imgseg_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:8]}",
+            )
             with open(dst + ".bin", "wb") as f:
                 f.write(data)
             return await asyncio.to_thread(self._fix_ext_by_format, dst + ".bin")
@@ -964,9 +969,11 @@ class GalleryPlugin(Star):
         """复制到 tmp 后再按真实格式改扩展名，避免改写协议端缓存文件。"""
         if not path or not os.path.exists(path):
             return path
+        # uuid 后缀避免并发本地化时微秒时间戳撞名（Windows 时钟精度不足）
         dst = os.path.join(
             self.tmp_dir,
-            f"img_{datetime.now().strftime('%Y%m%d%H%M%S%f')}{os.path.splitext(path)[1]}",
+            f"img_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+            f"_{uuid.uuid4().hex[:8]}{os.path.splitext(path)[1]}",
         )
         shutil.copy2(path, dst)
         return self._fix_ext_by_format(dst)

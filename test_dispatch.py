@@ -79,6 +79,12 @@ def _install_astrbot_mocks():
     for name in ["Plain", "At", "Image", "Record", "Video", "File", "Face",
                  "Reply", "Node", "Nodes", "Poke", "Forward"]:
         setattr(api_comp, name, type(name, (_Comp,), {}))
+
+    # Plain 兼容位置参数（真实签名是 Plain(text)）
+    def _plain_init(self, text: str = "", **kw):
+        self.text = text
+        self.__dict__.update(kw)
+    setattr(api_comp, "Plain", type("Plain", (_Comp,), {"__init__": _plain_init}))
     api_comp.Image.fromURL = classmethod(lambda cls, url: cls(url=url))
     api_comp.Image.fromFileSystem = classmethod(lambda cls, path: cls(file=path))
 
