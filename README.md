@@ -42,6 +42,12 @@ pip install pillow numpy aiohttp
 需在插件配置开启 `listen_all_messages`（允许监听所有消息）后才生效——开启后
 未唤醒的群消息也能用裸指令触发。
 
+写操作类中文指令（`上传`/`添加`/`创建画廊`/`添加别名`/`取消上传`/`上传记录` 等）
+要求指令名后带空格或到行尾，避免「创建画廊了」「添加失败了」这类普通聊天被误
+触发并落盘；`看`/`看所有` 等查询指令仍支持无空格写法。
+`enable_slash_prefix` 仅对 `listen_all_messages` 全消息监听模式生效；原生指令
+路径由 AstrBot 的 `wake_prefix` 决定（唤醒阶段已把前缀剥掉，插件看不到 `/`）。
+
 ### 普通用户
 | 指令 | 说明 |
 | --- | --- |
@@ -79,7 +85,7 @@ pip install pillow numpy aiohttp
 - `pick_limit`：一次 `/看` 最多图片数
 - `hash1_difference_threshold` / `hash2_difference_threshold`：查重阈值
 - `user_recent_revert_expired_hours`：用户撤销上传的时效（小时）
-- `enable_slash_prefix`：是否兼容 `/` 前缀（开启时 `/看` 与 `看` 都生效）
+- `enable_slash_prefix`：是否兼容 `/` 前缀（**仅对 `listen_all_messages` 全消息监听模式生效**；原生指令路径由 AstrBot 的 `wake_prefix` 决定，到达插件前前缀已被剥掉）
 - `listen_all_messages`：允许监听所有消息（开启后未唤醒消息的裸指令也能触发画廊指令）
 - `ai_review.*`：AI 审核设置——`enable` 开关、`provider_id` 下拉选择审核用 LLM 提供者（留空用默认）、`batch_notice_threshold` 批量上传提示阈值（默认 10 张）、`prompt` 审核提示词（已内置默认，可改）。需要 AstrBot 已配置支持视觉的 LLM；审核异常时降级放行
 
@@ -88,7 +94,7 @@ pip install pillow numpy aiohttp
 移植时修复了原 lunabot 画廊代码的若干问题：
 
 1. **`async_reload_gall` 重复加载**：原 `continue` 只跳过内层循环导致所有图片被重复加载，改用路径集合判断
-2. **`gall replace` force 失效**：原 `args.remove('force')` 在字符串上调用列表方法，改用 `replace`
+2. **`gall replace`/上传的 force 解析**：原 `args.remove('force')` 在字符串上调用列表方法且按子串删除，改为按空白分词识别独立 `force` token，画廊名/参数里含 force 不会被误伤
 3. **`%-S` 时间格式跨平台**：改用 `%S`，避免 Windows 下文件名异常
 4. **历史记录 id 复用**：原用 `len(history)+1`，清理后 id 会回退，改用自增计数器 `next_id`
 5. **查重闭包结构错误**：重构时修复了 `is_same` 传入列表而非首图的 bug

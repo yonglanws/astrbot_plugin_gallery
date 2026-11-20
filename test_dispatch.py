@@ -10,6 +10,7 @@
 
 import sys
 import os
+import builtins
 import types
 import asyncio
 import tempfile
@@ -25,8 +26,18 @@ def _install_astrbot_mocks():
 
     astrbot = types.ModuleType("astrbot")
     astrbot_api = types.ModuleType("astrbot.api")
+
+    def _mock_log(*args, **kwargs):
+        # 真实 astrbot logger 支持 exc_info 等关键字；main.py 的兜底异常分支
+        # 会调用 logger.error(..., exc_info=True)，mock 必须一并接受，
+        # 否则测试会在日志调用处先抛 TypeError，掩盖被测行为
+        print(*args)
+
     astrbot_api.logger = types.SimpleNamespace(
-        info=print, warning=print, error=print, debug=lambda *a: None
+        info=_mock_log,
+        warning=_mock_log,
+        error=_mock_log,
+        debug=lambda *a, **k: None,
     )
     astrbot_api.AstrBotConfig = dict
 
@@ -251,12 +262,25 @@ class TestResults:
         return self.failed == 0
 
 
+class HandlerResults(list):
+    """一次 handler 执行的产出：yield 结果列表 + event.send 直发快照。
+
+    看图等路径直接调用 event.send() 而不 yield，只看 yield 结果会把
+    「其实已经回复了」误判成「0 回复」，因此两种产出必须一起记录。
+    """
+
+    def __init__(self, results=(), sent=()):
+        super().__init__(results)
+        self.sent = list(sent)
+
+
 async def run_handler(plugin, event):
-    """收集 on_message 异步生成器的所有结果。"""
+    """收集 on_message 异步生成器的所有结果，并记录 event.sent 直发内容。"""
     results = []
     async for r in plugin.on_message(event):
         results.append(r)
-    return results
+    # 生成器耗尽后再快照，确保 send() 记录完整
+    return HandlerResults(results, event.sent)
 
 
 async def run_native(plugin, event, name):
@@ -264,7 +288,44 @@ async def run_native(plugin, event, name):
     results = []
     async for r in getattr(plugin, name)(event):
         results.append(r)
-    return results
+    return HandlerResults(results, event.sent)
+
+
+def assert_no_reply(r, name, results, detail=""):
+    """断言「完全没有回复」：既没有 yield 结果，也没有 event.send 直发。"""
+    sent = getattr(results, "sent", [])
+    r.check(
+        name,
+        len(results) == 0 and not sent,
+        f"res={list(results)} sent={sent} {detail}".strip(),
+    )
+
+
+class RangeSpy:
+    """临时替换 builtins.range 记录调用参数。
+
+    用于验证「先校验区间大小再 list(range(...))」：展开 1e8 个 pid 会产生
+    巨大列表，通过断言没有出现跨度 > 1000 的 range 调用来抓住回退。
+    """
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+        self._orig = builtins.range
+
+    def __enter__(self):
+        self._orig = builtins.range
+        calls = self.calls
+
+        def spy(*args):
+            calls.append(args)
+            return self._orig(*args)
+
+        builtins.range = spy
+        return self
+
+    def __exit__(self, *exc):
+        builtins.range = self._orig
+        return False
 
 
 def make_plugin(config=None):
@@ -282,6 +343,309 @@ async def add_pic(plugin, gall, color=(200, 30, 30)):
     return await plugin.gallery_manager.async_add_pic(gall, p, check_duplicated=False)
 
 
+def chain_text(res):
+    """把 chain/plain 结果里的文本拼出来。"""
+    out = []
+    for kind, payload in res:
+        if kind == "chain":
+            out.extend(str(getattr(c, "text", "")) for c in payload)
+        elif kind == "plain":
+            out.append(str(payload))
+    return "\n".join(out)
+
+
+def make_review_provider(outputs):
+    """按调用顺序返回预设 completion_text 的 mock LLM 提供者。"""
+    calls = []
+
+    async def text_chat(prompt=None, session_id=None, image_urls=None,
+                        contexts=None, **kw):
+        calls.append({"prompt": prompt, "image": (image_urls or [None])[0]})
+        i = len(calls) - 1
+        if isinstance(outputs, Exception):
+            raise outputs
+        return types.SimpleNamespace(
+            completion_text=outputs[min(i, len(outputs) - 1)]
+        )
+
+    prov = types.SimpleNamespace(text_chat=text_chat)
+    prov.calls = calls
+    return prov
+
+
+def make_review_img(color: int):
+    """用整数做种子生成 8px 随机灰度方块图。
+
+    感知哈希缩图后仍保留大尺度结构，保证图片间查重判定互不重复
+    （纯色/细噪声图缩到 16x16 后几乎一致，会被判重）。
+    """
+    import random as _random
+    from PIL import Image as _PImgR
+    rng = _random.Random(color)
+    p = os.path.join(tempfile.gettempdir(), f"gallery_review_{color}.png")
+    img = _PImgR.new("RGB", (64, 64))
+    px = img.load()
+    for bx in range(8):
+        for by in range(8):
+            v = rng.randrange(256)
+            for x in range(bx * 8, bx * 8 + 8):
+                for y in range(by * 8, by * 8 + 8):
+                    px[x, y] = (v, v, v)
+    img.save(p, format="PNG")
+    return p
+
+
+async def test_regressions(r):
+    """M1/M6/M7/M8/M9/M2/S1 的指令层回归用例（可单独调用）。"""
+    # ---- 13. 回归：指令解析 / force / 删除区间 / 日志 / 无法识别图片 ----
+    print("\n[测试] 回归：指令解析与上传边界")
+
+    async def upload_file(plugin_inst, msg, path):
+        ev = MockEvent(msg)
+        ev.message_obj.message = [Comp.Image(file=path)]
+        return await run_handler(plugin_inst, ev)
+
+    # M1：写操作指令必须指令名后为空白或行尾；查询类「看miku」保持无空格前缀匹配
+    plugin_m1 = make_plugin()
+    plugin_m1.gallery_manager.ensure_loaded()
+    plugin_m1.gallery_manager.open_gall("miku")
+    await plugin_m1.gallery_manager._save()
+    await add_pic(plugin_m1, "miku")
+
+    ev_m1 = MockEvent("创建画廊了")
+    res_m1 = await run_handler(plugin_m1, ev_m1)
+    assert_no_reply(r, "创建画廊了 不回复", res_m1, f"stopped={ev_m1.stopped}")
+    r.check(
+        "创建画廊了 未创建画廊且不拦截",
+        "了" not in plugin_m1.gallery_manager.galleries
+        and "miku" in plugin_m1.gallery_manager.galleries
+        and ev_m1.stopped is False,
+        f"galls={list(plugin_m1.gallery_manager.galleries)} stopped={ev_m1.stopped}",
+    )
+
+    ev_m1b = MockEvent("看miku")
+    res_m1b = await run_handler(plugin_m1, ev_m1b)
+    chains_m1b = [x for x in ev_m1b.sent if isinstance(x, tuple) and x[0] == "chain"]
+    r.check(
+        "看miku 无空格仍能看图",
+        len(res_m1b) == 0 and len(chains_m1b) == 1 and ev_m1b.stopped is True,
+        f"res={list(res_m1b)} sent={ev_m1b.sent}",
+    )
+
+    ev_m1c = MockEvent("取消上传们")
+    res_m1c = await run_handler(plugin_m1, ev_m1c)
+    assert_no_reply(r, "取消上传们 不误触发撤销", res_m1c, f"stopped={ev_m1c.stopped}")
+    r.check("取消上传们 不拦截", ev_m1c.stopped is False)
+
+    # M6：force 按独立 token 识别，画廊名里的 force 子串不能误伤
+    plugin_m6 = make_plugin()
+    plugin_m6.gallery_manager.ensure_loaded()
+    for _name in ("myforce", "mikuforce", "miku"):
+        plugin_m6.gallery_manager.open_gall(_name)
+    await plugin_m6.gallery_manager._save()
+
+    res_m6a = await upload_file(plugin_m6, "上传 myforce", make_review_img(61001))
+    text_m6a = chain_text(res_m6a)
+    r.check(
+        "画廊名 myforce 能正常上传",
+        "成功上传1/1" in text_m6a
+        and '到"myforce"' in text_m6a
+        and len(plugin_m6.gallery_manager.galleries["myforce"].pics) == 1,
+        f"res={text_m6a}",
+    )
+
+    m6_img = make_review_img(61002)
+    await upload_file(plugin_m6, "上传 mikuforce", m6_img)
+    r.check(
+        "mikuforce 首张上传成功",
+        len(plugin_m6.gallery_manager.galleries["mikuforce"].pics) == 1,
+        f"pics={len(plugin_m6.gallery_manager.galleries['mikuforce'].pics)}",
+    )
+    res_m6b = await upload_file(plugin_m6, "上传 mikuforce", m6_img)
+    text_m6b = chain_text(res_m6b)
+    r.check(
+        "mikuforce 不会被当成 force 参数",
+        "重复" in text_m6b
+        and len(plugin_m6.gallery_manager.galleries["mikuforce"].pics) == 1
+        and len(plugin_m6.gallery_manager.galleries["miku"].pics) == 0,
+        f"res={text_m6b} "
+        f"mikuforce={len(plugin_m6.gallery_manager.galleries['mikuforce'].pics)} "
+        f"miku={len(plugin_m6.gallery_manager.galleries['miku'].pics)}",
+    )
+    res_m6c = await upload_file(plugin_m6, "上传 mikuforce force", m6_img)
+    r.check(
+        "mikuforce force 才强制上传",
+        "成功上传1/1" in chain_text(res_m6c)
+        and len(plugin_m6.gallery_manager.galleries["mikuforce"].pics) == 2,
+        f"res={chain_text(res_m6c)}",
+    )
+
+    # M7：/gall del 超大区间先校验再展开；「1 -2」按逐个 pid 解析
+    plugin_m7 = make_plugin()
+    plugin_m7.gallery_manager.ensure_loaded()
+    plugin_m7.gallery_manager.open_gall("删除")
+    await plugin_m7.gallery_manager._save()
+    for _color in ((10, 10, 10), (20, 20, 20), (30, 30, 30), (40, 40, 40)):
+        await add_pic(plugin_m7, "删除", color=_color)
+    g_m7 = plugin_m7.gallery_manager.galleries["删除"]
+
+    ev_del_big = MockEvent("gall del 1-100000000", admin=True)
+    with RangeSpy() as range_spy:
+        res_del_big = await run_handler(plugin_m7, ev_del_big)
+    text_del_big = chain_text(res_del_big)
+    huge_range = [a for a in range_spy.calls if len(a) >= 2 and a[1] - a[0] > 1000]
+    r.check(
+        "超大删除区间被拒",
+        "一次最多删除20张连续图片" in text_del_big,
+        f"res={text_del_big}",
+    )
+    r.check(
+        "超大删除区间未展开大列表",
+        huge_range == [],
+        f"huge_range_calls={huge_range}",
+    )
+    r.check(
+        "超大删除区间未删除图片",
+        sorted(p.pid for p in g_m7.pics) == [1, 2, 3, 4],
+        f"pids={[p.pid for p in g_m7.pics]}",
+    )
+
+    ev_del_neg = MockEvent("gall del 1 -2", admin=True)
+    res_del_neg = await run_handler(plugin_m7, ev_del_neg)
+    remaining = sorted(p.pid for p in g_m7.pics)
+    # -2 是全局倒数第 2 张（pid=3），所以留下 [2,4]；
+    # 若被误解析成区间 1..2 会留下 [3,4]，此断言能抓住旧行为
+    r.check(
+        "gall del 1 -2 按逐个 pid 解析而非区间",
+        remaining == [2, 4],
+        f"remaining={remaining} res={chain_text(res_del_neg)}",
+    )
+
+    # M8：/gall log 1 不能命中 pid=10 / pid=100
+    plugin_m8 = make_plugin()
+    plugin_m8.gallery_manager.ensure_loaded()
+    log_path = os.path.join(plugin_m8.data_dir, "add.log")
+    with open(log_path, "w", encoding="utf-8") as _f:
+        _f.write('2026-01-01 00:00:00 | @u upload pid=10 to "g"\n')
+        _f.write('2026-01-01 00:00:01 | @u upload pid=1 to "g"\n')
+        _f.write('2026-01-01 00:00:02 | @u upload pid=100 to "g"\n')
+    ev_log1 = MockEvent("gall log 1", admin=True)
+    res_log1 = await run_handler(plugin_m8, ev_log1)
+    text_log1 = chain_text(res_log1)
+    r.check(
+        "gall log 1 不命中 pid=10/100",
+        "pid=1 to" in text_log1
+        and "pid=10" not in text_log1
+        and "pid=100" not in text_log1,
+        f"res={text_log1}",
+    )
+    ev_log10 = MockEvent("gall log 10", admin=True)
+    res_log10 = await run_handler(plugin_m8, ev_log10)
+    r.check(
+        "gall log 10 命中 pid=10",
+        "pid=10 to" in chain_text(res_log10),
+        f"res={chain_text(res_log10)}",
+    )
+
+    # M9：Image 组件没有 url/file 时回执必须点名「无法识别」
+    plugin_m9 = make_plugin()
+    plugin_m9.gallery_manager.ensure_loaded()
+    plugin_m9.gallery_manager.open_gall("无法识别")
+    await plugin_m9.gallery_manager._save()
+
+    ev_u1 = MockEvent("上传 无法识别")
+    ev_u1.message_obj.message = [Comp.Image()]  # url/file 都没有
+    res_u1 = await run_handler(plugin_m9, ev_u1)
+    text_u1 = chain_text(res_u1)
+    r.check(
+        "无url/file的Image回执提示无法识别",
+        "无法识别" in text_u1,
+        f"res={text_u1}",
+    )
+    r.check(
+        "无法识别的图片未入库",
+        len(plugin_m9.gallery_manager.galleries["无法识别"].pics) == 0,
+        f"pics={plugin_m9.gallery_manager.galleries['无法识别'].pics}",
+    )
+
+    ev_u2 = MockEvent("上传 无法识别")
+    ev_u2.message_obj.message = [
+        Comp.Image(file=make_review_img(91001)),
+        Comp.Image(),
+    ]
+    res_u2 = await run_handler(plugin_m9, ev_u2)
+    text_u2 = chain_text(res_u2)
+    r.check(
+        "部分无法识别时回执分母含跳过数",
+        "成功上传1/2" in text_u2 and "1 张图片无法识别已跳过" in text_u2,
+        f"res={text_u2}",
+    )
+
+    # M2：兜底异常只回固定文案，绝对路径/异常原文只进日志
+    print("\n[测试] 回归：兜底异常不泄露细节")
+    import astrbot_plugin_gallery_rt.main as main_mod
+
+    plugin_err = make_plugin()
+    plugin_err.gallery_manager.ensure_loaded()
+
+    async def _boom_dispatch(event, cmd, args):
+        raise RuntimeError(r"读取 C:\server\secret\gallery.json 失败")
+        yield  # pragma: no cover - 让函数成为异步生成器
+
+    plugin_err._dispatch = _boom_dispatch
+    log_calls = []
+    orig_logger = main_mod.logger
+    main_mod.logger = types.SimpleNamespace(
+        info=lambda *a, **k: None,
+        warning=lambda *a, **k: None,
+        error=lambda *a, **k: log_calls.append((a, k)),
+        debug=lambda *a, **k: None,
+    )
+    try:
+        ev_err = MockEvent("看 miku")
+        res_err = await run_handler(plugin_err, ev_err)
+    finally:
+        main_mod.logger = orig_logger
+    text_err = chain_text(res_err)
+    r.check(
+        "兜底异常群回执为固定文案",
+        text_err == "处理出错，已记录日志",
+        f"res={text_err}",
+    )
+    r.check(
+        "兜底异常不回显绝对路径/异常原文",
+        "C:\\server" not in text_err and "RuntimeError" not in text_err,
+        f"res={text_err}",
+    )
+    logged = " ".join(str(x) for x in log_calls[0][0]) if log_calls else ""
+    r.check(
+        "兜底异常写入 error 日志并带堆栈",
+        bool(log_calls)
+        and log_calls[0][1].get("exc_info") is True
+        and "C:\\server" in logged,
+        f"log_calls={log_calls}",
+    )
+
+    # S1：非法画廊名「..」在指令层也要被拒
+    print("\n[测试] 回归：非法画廊名")
+    plugin_s1 = make_plugin()
+    plugin_s1.gallery_manager.ensure_loaded()
+    data_dir_s1 = plugin_s1.data_dir
+    ev_s1 = MockEvent("创建画廊 ..")
+    res_s1 = await run_handler(plugin_s1, ev_s1)
+    text_s1 = chain_text(res_s1)
+    r.check(
+        '创建画廊 ".." 被拒',
+        "无效" in text_s1 and ".." not in plugin_s1.gallery_manager.galleries,
+        f"res={text_s1}",
+    )
+    r.check(
+        '创建画廊 ".." 后数据目录仍在',
+        os.path.isdir(data_dir_s1),
+        f"data_dir={data_dir_s1}",
+    )
+
+
 async def main():
     r = TestResults()
     print("\n[测试] 指令路由层")
@@ -292,12 +656,12 @@ async def main():
     # ---- 1. 非画廊指令放行 ----
     ev = MockEvent("你好呀今天天气不错")
     results = await run_handler(plugin, ev)
-    r.check("普通消息不回复", len(results) == 0, f"results={results}")
+    assert_no_reply(r, "普通消息不回复", results)
     r.check("普通消息不拦截", ev.stopped is False)
 
     ev2 = MockEvent("/help")  # 其他插件指令
     results2 = await run_handler(plugin, ev2)
-    r.check("其他指令前缀不回复", len(results2) == 0)
+    assert_no_reply(r, "其他指令前缀不回复", results2)
     r.check("其他指令不拦截", ev2.stopped is False)
 
     # ---- 2. / 兼容与裸指令 ----
@@ -387,7 +751,8 @@ async def main():
 
     ev_false = MockEvent("gallery")
     res_false = await run_handler(plugin, ev_false)
-    r.check("gallery 不误触发 gall", len(res_false) == 0 and ev_false.stopped is False)
+    assert_no_reply(r, "gallery 不误触发 gall", res_false)
+    r.check("gallery 不拦截", ev_false.stopped is False)
 
     # ---- 3. enable_slash_prefix=False 仅裸指令 ----
     plugin2 = make_plugin({"enable_slash_prefix": False})
@@ -398,7 +763,8 @@ async def main():
 
     ev5 = MockEvent("/看 表情")
     res5 = await run_handler(plugin2, ev5)
-    r.check("关闭斜杠兼容后 / 指令被忽略", len(res5) == 0 and ev5.stopped is False)
+    assert_no_reply(r, "关闭斜杠兼容后 / 指令被忽略", res5)
+    r.check("关闭斜杠兼容后 / 指令不拦截", ev5.stopped is False)
 
     ev6 = MockEvent("看 表情")
     res6 = await run_handler(plugin2, ev6)
@@ -536,82 +902,55 @@ async def main():
 
     ev11 = MockEvent("下载图包")
     res11 = await run_handler(plugin3, ev11)
-    r.check(
-        "下载图包 已移除，消息放行",
-        len(res11) == 0 and ev11.stopped is False,
-        f"res={res11} stopped={ev11.stopped}",
-    )
+    assert_no_reply(r, "下载图包 已移除，消息放行", res11, f"stopped={ev11.stopped}")
+    r.check("下载图包 不拦截", ev11.stopped is False)
 
     # ---- 7. 参数缺失/无法解析：静默放行（群聊里以「看」开头极易误触发） ----
     ev12 = MockEvent("看")
     res12 = await run_handler(plugin3, ev12)
-    r.check(
-        "看 无参数静默放行",
-        len(res12) == 0 and ev12.stopped is False,
-        f"res={res12} stopped={ev12.stopped}",
-    )
+    assert_no_reply(r, "看 无参数静默放行", res12, f"stopped={ev12.stopped}")
+    r.check("看 无参数不拦截", ev12.stopped is False)
 
     ev12b = MockEvent("看x2")
     res12b = await run_handler(plugin3, ev12b)
-    r.check(
-        "看x2 空画廊名静默放行",
-        len(res12b) == 0 and ev12b.stopped is False,
-        f"res={res12b} stopped={ev12b.stopped}",
-    )
+    assert_no_reply(r, "看x2 空画廊名静默放行", res12b, f"stopped={ev12b.stopped}")
+    r.check("看x2 不拦截", ev12b.stopped is False)
 
     ev12c = MockEvent("看 中文画廊 -x")
     res12c = await run_handler(plugin3, ev12c)
-    r.check(
-        "-N 后缀解析失败静默放行",
-        len(res12c) == 0 and ev12c.stopped is False,
-        f"res={res12c} stopped={ev12c.stopped}",
-    )
+    assert_no_reply(r, "-N 后缀解析失败静默放行", res12c, f"stopped={ev12c.stopped}")
+    r.check("-N 后缀解析失败不拦截", ev12c.stopped is False)
 
     ev12d = MockEvent("看 中文画廊 xabc")
     res12d = await run_handler(plugin3, ev12d)
-    r.check(
-        "xN 后缀解析失败静默放行",
-        len(res12d) == 0 and ev12d.stopped is False,
-        f"res={res12d} stopped={ev12d.stopped}",
-    )
+    assert_no_reply(r, "xN 后缀解析失败静默放行", res12d, f"stopped={ev12d.stopped}")
+    r.check("xN 后缀解析失败不拦截", ev12d.stopped is False)
 
     ev12e = MockEvent("看 - 1")
     res12e = await run_handler(plugin3, ev12e)
-    r.check(
-        "看 - 1 空画廊名静默放行",
-        len(res12e) == 0 and ev12e.stopped is False,
-        f"res={res12e} stopped={ev12e.stopped}",
-    )
+    assert_no_reply(r, "看 - 1 空画廊名静默放行", res12e, f"stopped={ev12e.stopped}")
+    r.check("看 - 1 不拦截", ev12e.stopped is False)
 
     # 原生注册路径共用 _handle_cmd，同样静默放行
     ev12f = MockEvent("看", wake=True)
     res12f = await run_native(plugin3, ev12f, "cmd_pick_native")
-    r.check(
-        "原生 看 无参数静默放行",
-        len(res12f) == 0 and ev12f.stopped is False,
-        f"res={res12f} stopped={ev12f.stopped}",
-    )
+    assert_no_reply(r, "原生 看 无参数静默放行", res12f, f"stopped={ev12f.stopped}")
+    r.check("原生 看 无参数不拦截", ev12f.stopped is False)
 
     ev12g = MockEvent("看x2", wake=True)
     res12g = await run_native(plugin3, ev12g, "cmd_pick_native")
-    r.check(
-        "原生 看x2 静默放行",
-        len(res12g) == 0 and ev12g.stopped is False,
-        f"res={res12g} stopped={ev12g.stopped}",
-    )
+    assert_no_reply(r, "原生 看x2 静默放行", res12g, f"stopped={ev12g.stopped}")
+    r.check("原生 看x2 不拦截", ev12g.stopped is False)
 
     ev12h = MockEvent("看 中文画廊 -x", wake=True)
     res12h = await run_native(plugin3, ev12h, "cmd_pick_native")
-    r.check(
-        "原生 看 后缀解析失败静默放行",
-        len(res12h) == 0 and ev12h.stopped is False,
-        f"res={res12h} stopped={ev12h.stopped}",
-    )
+    assert_no_reply(r, "原生 看 后缀解析失败静默放行", res12h, f"stopped={ev12h.stopped}")
+    r.check("原生 看 后缀解析失败不拦截", ev12h.stopped is False)
 
     # ---- 7b. 画廊不存在：查询类指令静默放行；写操作仍提示错误 ----
     ev_nf = MockEvent("看 不存在的画廊")
     res_nf = await run_handler(plugin3, ev_nf)
-    r.check("看 不存在画廊 不回复", len(res_nf) == 0, f"res={res_nf}")
+    assert_no_reply(r, "看 不存在画廊 不回复", res_nf)
     r.check("看 不存在画廊 不拦截(放行传播)", ev_nf.stopped is False)
 
     ev_nf2 = MockEvent("gall close 不存在的画廊", admin=True)
@@ -643,14 +982,12 @@ async def main():
     # 兼容监听关闭（默认）：on_message 不做任何事
     ev_w1 = MockEvent("看 唤醒测试", wake=False)
     res_w1 = await run_handler(plugin_w, ev_w1)
-    r.check(
-        "listen_all 关闭时监听器不触发",
-        len(res_w1) == 0 and ev_w1.stopped is False,
-        f"res={res_w1} stopped={ev_w1.stopped}",
-    )
+    assert_no_reply(r, "listen_all 关闭时监听器不触发", res_w1, f"stopped={ev_w1.stopped}")
+    r.check("listen_all 关闭时不拦截", ev_w1.stopped is False)
     ev_w2 = MockEvent("随便聊聊天气", wake=False)
     res_w2 = await run_handler(plugin_w, ev_w2)
-    r.check("listen_all 关闭时普通消息放行", len(res_w2) == 0 and ev_w2.stopped is False)
+    assert_no_reply(r, "listen_all 关闭时普通消息放行", res_w2, f"stopped={ev_w2.stopped}")
+    r.check("listen_all 关闭时普通消息不拦截", ev_w2.stopped is False)
 
     # 原生指令注册：模拟 AstrBot CommandFilter 命中后调用对应 handler
     ev_w3 = MockEvent("看 唤醒测试", wake=True)
@@ -691,7 +1028,8 @@ async def main():
     )
     ev_w6 = MockEvent("随便聊聊天气", wake=False)
     res_w6 = await run_handler(plugin_w2, ev_w6)
-    r.check("开启全监听后非指令仍放行", len(res_w6) == 0 and ev_w6.stopped is False)
+    assert_no_reply(r, "开启全监听后非指令仍放行", res_w6, f"stopped={ev_w6.stopped}")
+    r.check("开启全监听后非指令不拦截", ev_w6.stopped is False)
 
     # ---- 8. 合并转发消息解析 ----
     print("\n[测试] 合并转发消息解析")
@@ -1163,55 +1501,6 @@ async def main():
     # ---- 12. AI 审核 ----
     print("\n[测试] AI 审核")
 
-    def chain_text(res):
-        """把 chain/plain 结果里的文本拼出来。"""
-        out = []
-        for kind, payload in res:
-            if kind == "chain":
-                out.extend(str(getattr(c, "text", "")) for c in payload)
-            elif kind == "plain":
-                out.append(str(payload))
-        return "\n".join(out)
-
-    def make_review_provider(outputs):
-        """按调用顺序返回预设 completion_text 的 mock LLM 提供者。"""
-        calls = []
-
-        async def text_chat(prompt=None, session_id=None, image_urls=None,
-                            contexts=None, **kw):
-            calls.append({"prompt": prompt, "image": (image_urls or [None])[0]})
-            i = len(calls) - 1
-            if isinstance(outputs, Exception):
-                raise outputs
-            return types.SimpleNamespace(
-                completion_text=outputs[min(i, len(outputs) - 1)]
-            )
-
-        prov = types.SimpleNamespace(text_chat=text_chat)
-        prov.calls = calls
-        return prov
-
-    def make_review_img(color: int):
-        """用整数做种子生成 8px 随机灰度方块图。
-
-        感知哈希缩图后仍保留大尺度结构，保证图片间查重判定互不重复
-        （纯色/细噪声图缩到 16x16 后几乎一致，会被判重）。
-        """
-        import random as _random
-        from PIL import Image as _PImgR
-        rng = _random.Random(color)
-        p = os.path.join(tempfile.gettempdir(), f"gallery_review_{color}.png")
-        img = _PImgR.new("RGB", (64, 64))
-        px = img.load()
-        for bx in range(8):
-            for by in range(8):
-                v = rng.randrange(256)
-                for x in range(bx * 8, bx * 8 + 8):
-                    for y in range(by * 8, by * 8 + 8):
-                        px[x, y] = (v, v, v)
-        img.save(p, format="PNG")
-        return p
-
     # 12a. 审核不通过：图片拒绝入库
     prov_a = make_review_provider(['{"pass": false, "reason": "疑似广告二维码"}'])
     plugin_ra = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 3}})
@@ -1233,6 +1522,45 @@ async def main():
         f"pics={plugin_ra.gallery_manager.galleries['审核画廊'].pics}",
     )
     r.check("审核调用了LLM", len(prov_a.calls) == 1, f"calls={len(prov_a.calls)}")
+
+    # 12a-2. pass 为字符串 "false"：必须判为不通过
+    # （bool("false") 是 True，旧实现会把模型拒绝当成通过）
+    prov_a2 = make_review_provider(['{"pass": "false", "reason": "疑似广告二维码"}'])
+    plugin_ra2 = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 99}})
+    plugin_ra2.context.get_using_provider = lambda: prov_a2
+    plugin_ra2.gallery_manager.ensure_loaded()
+    plugin_ra2.gallery_manager.open_gall("审核画廊1b")
+    await plugin_ra2.gallery_manager._save()
+    ev_ra2 = MockEvent("上传 审核画廊1b")
+    ev_ra2.message_obj.message = [Comp.Image(file=make_review_img(223344))]
+    res_ra2 = await run_handler(plugin_ra2, ev_ra2)
+    r.check(
+        'AI返回pass字符串"false"时拒绝',
+        "未通过AI审核" in chain_text(res_ra2),
+        f"res={chain_text(res_ra2)}",
+    )
+    r.check(
+        'pass字符串"false"的图片未入库',
+        len(plugin_ra2.gallery_manager.galleries["审核画廊1b"].pics) == 0,
+        f"pics={plugin_ra2.gallery_manager.galleries['审核画廊1b'].pics}",
+    )
+
+    # 12a-3. JSON 里缺 pass 键：按「解析失败」放行，不能默认判定
+    prov_a3 = make_review_provider(['{"reason": "模型只给了理由", "score": 0}'])
+    plugin_ra3 = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 99}})
+    plugin_ra3.context.get_using_provider = lambda: prov_a3
+    plugin_ra3.gallery_manager.ensure_loaded()
+    plugin_ra3.gallery_manager.open_gall("审核画廊1c")
+    await plugin_ra3.gallery_manager._save()
+    ev_ra3 = MockEvent("上传 审核画廊1c")
+    ev_ra3.message_obj.message = [Comp.Image(file=make_review_img(334455))]
+    res_ra3 = await run_handler(plugin_ra3, ev_ra3)
+    r.check(
+        "AI输出缺pass键时按解析失败放行",
+        "成功上传1/1" in chain_text(res_ra3)
+        and len(plugin_ra3.gallery_manager.galleries["审核画廊1c"].pics) == 1,
+        f"res={chain_text(res_ra3)}",
+    )
 
     # 12b. 审核通过：正常入库
     prov_b = make_review_provider(['{"pass": true}'])
@@ -1327,8 +1655,20 @@ async def main():
         f"res={chain_text(res_rf)}",
     )
 
-    # 12g. 审核关闭：完全不调用 provider
+    # 12g. 审核关闭：完全不调用 provider（连获取 provider 都不应发生）
     plugin_rg = make_plugin()
+    provider_calls_g = []
+
+    def _spy_using_provider():
+        provider_calls_g.append("using")
+        return make_review_provider(['{"pass": true}'])
+
+    def _spy_provider_by_id(pid):
+        provider_calls_g.append(("id", pid))
+        return make_review_provider(['{"pass": true}'])
+
+    plugin_rg.context.get_using_provider = _spy_using_provider
+    plugin_rg.context.get_provider_by_id = _spy_provider_by_id
     plugin_rg.gallery_manager.ensure_loaded()
     plugin_rg.gallery_manager.open_gall("审核画廊7")
     await plugin_rg.gallery_manager._save()
@@ -1339,6 +1679,11 @@ async def main():
         "审核关闭时正常上传",
         "成功上传1/1" in chain_text(res_rg),
         f"res={chain_text(res_rg)}",
+    )
+    r.check(
+        "审核关闭时 provider 完全未被调用",
+        provider_calls_g == [],
+        f"calls={provider_calls_g}",
     )
 
     # 12h. 指定 provider_id 走 get_provider_by_id
@@ -1365,6 +1710,7 @@ async def main():
         f"res={chain_text(res_rh)} calls={len(prov_h.calls)}",
     )
 
+    await test_regressions(r)
     ok2 = r.summary()
     sys.exit(0 if ok and ok2 else 1)
 

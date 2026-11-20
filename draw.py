@@ -16,6 +16,7 @@ Grid / TextBox / ImageBox / Spacer / TextStyle。用 Pillow 的 ImageDraw 直接
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 import contextvars
@@ -23,6 +24,9 @@ from dataclasses import dataclass
 from typing import Union, Tuple, List, Optional, Callable
 
 from PIL import Image, ImageDraw, ImageFont
+
+# 用标准库 logger 而非 astrbot 的，保持本模块可独立导入（测试/工具脚本）。
+logger = logging.getLogger(__name__)
 
 # ==================== 常量与颜色 ====================
 
@@ -55,6 +59,9 @@ DEFAULT_BOLD_FONT = "SourceHanSansCN-Bold"
 _font_cache: dict[str, ImageFont.FreeTypeFont] = {}
 _font_searched = False
 _font_candidates: list[str] = []
+# 渲染可能跑在线程池里（asyncio.to_thread），字体缓存需要加锁，
+# 避免并发首次加载时把兜底的默认字体缓存下来
+_font_lock = threading.Lock()
 
 
 def _collect_font_candidates() -> list[str]:
@@ -95,37 +102,38 @@ def _collect_font_candidates() -> list[str]:
 def _get_pil_font(font_name: str, size: int) -> ImageFont.FreeTypeFont:
     """加载字体，带缓存与回退。粗体与常规均优先使用插件自带的 MiSans 字体。"""
     key = f"{font_name}_{size}"
-    if key in _font_cache:
-        return _font_cache[key]
-    _collect_font_candidates()
-    bold = "Bold" in font_name or "bold" in font_name
-    font = None
-    # 优先 MiSans-Bold（粗体时）或 MiSans-Medium（常规时）
-    for path in _font_candidates:
-        base = os.path.basename(path).lower()
-        is_bold_file = "bold" in base
-        if bold and not is_bold_file:
-            continue
-        if os.path.exists(path):
-            try:
-                font = ImageFont.truetype(path, size)
-                break
-            except Exception:
-                continue
-    if font is None:
-        # 不区分粗细再找一次
+    with _font_lock:
+        if key in _font_cache:
+            return _font_cache[key]
+        _collect_font_candidates()
+        bold = "Bold" in font_name or "bold" in font_name
+        font = None
+        # 优先 MiSans-Bold（粗体时）或 MiSans-Medium（常规时）
         for path in _font_candidates:
+            base = os.path.basename(path).lower()
+            is_bold_file = "bold" in base
+            if bold and not is_bold_file:
+                continue
             if os.path.exists(path):
                 try:
                     font = ImageFont.truetype(path, size)
                     break
                 except Exception:
                     continue
-    if font is None:
-        # 最后回退到默认字体（中文可能无法显示）
-        font = ImageFont.load_default(size if size <= 32 else 32)
-    _font_cache[key] = font
-    return font
+        if font is None:
+            # 不区分粗细再找一次
+            for path in _font_candidates:
+                if os.path.exists(path):
+                    try:
+                        font = ImageFont.truetype(path, size)
+                        break
+                    except Exception:
+                        continue
+        if font is None:
+            # 最后回退到默认字体（中文可能无法显示）
+            font = ImageFont.load_default(size if size <= 32 else 32)
+        _font_cache[key] = font
+        return font
 
 
 def get_text_size(font: ImageFont.FreeTypeFont, text: str) -> Size:
@@ -221,30 +229,37 @@ class Painter:
 
     def paste(self, image: Image.Image, pos: Position, size: Size = None,
               use_shadow: bool = False, shadow_width: int = 6, shadow_alpha: float = 0.6):
-        x = self.offset[0] + pos[0]
-        y = self.offset[1] + pos[1]
-        if size and tuple(image.size) != tuple(size):
-            # 与原版一致：精确缩放到目标尺寸（fit 模式下宽高比已由 ImageBox 算好）
-            image = image.resize((int(size[0]), int(size[1])), Image.Resampling.LANCZOS)
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-        self.img.alpha_composite(image, (x, y))
+        # 单张图损坏/截断时只跳过这张，不让整张渲染失败（调用方已按布局留好位置）
+        try:
+            x = self.offset[0] + pos[0]
+            y = self.offset[1] + pos[1]
+            if size and tuple(image.size) != tuple(size):
+                # 与原版一致：精确缩放到目标尺寸（fit 模式下宽高比已由 ImageBox 算好）
+                image = image.resize((int(size[0]), int(size[1])), Image.Resampling.LANCZOS)
+            if image.mode != "RGBA":
+                image = image.convert("RGBA")
+            self.img.alpha_composite(image, (x, y))
+        except Exception as e:
+            logger.warning(f"绘制图片失败，已跳过该图: {e}")
 
     def paste_with_alphablend(self, image: Image.Image, pos: Position, size: Size = None,
                               alpha_adjust: float = 1.0,
                               use_shadow: bool = False, shadow_width: int = 6,
                               shadow_alpha: float = 0.6):
-        x = self.offset[0] + pos[0]
-        y = self.offset[1] + pos[1]
-        if size and tuple(image.size) != tuple(size):
-            image = image.resize((int(size[0]), int(size[1])), Image.Resampling.LANCZOS)
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-        if alpha_adjust != 1.0:
-            r, g, b, a = image.split()
-            a = a.point(lambda v: int(v * alpha_adjust))
-            image = Image.merge("RGBA", (r, g, b, a))
-        self.img.alpha_composite(image, (x, y))
+        try:
+            x = self.offset[0] + pos[0]
+            y = self.offset[1] + pos[1]
+            if size and tuple(image.size) != tuple(size):
+                image = image.resize((int(size[0]), int(size[1])), Image.Resampling.LANCZOS)
+            if image.mode != "RGBA":
+                image = image.convert("RGBA")
+            if alpha_adjust != 1.0:
+                r, g, b, a = image.split()
+                a = a.point(lambda v: int(v * alpha_adjust))
+                image = Image.merge("RGBA", (r, g, b, a))
+            self.img.alpha_composite(image, (x, y))
+        except Exception as e:
+            logger.warning(f"绘制图片失败，已跳过该图: {e}")
 
 
 # ==================== 背景 ====================
@@ -298,7 +313,10 @@ class Widget:
     @staticmethod
     def get_current_widget_stack():
         local = Widget._thread_local.get()
-        return local.wstack if local is not None else None
+        if local is None:
+            return None
+        # 工作线程里 threading.local 可能是从别的线程继承来的空壳
+        return getattr(local, "wstack", None)
 
     @classmethod
     def get_current_widget(cls) -> Optional['Widget']:
@@ -309,16 +327,22 @@ class Widget:
         local = self._thread_local.get()
         if local is None:
             local = threading.local()
-            local.wstack = []
-        local.wstack.append(self)
-        self._thread_local.set(local)
+            self._thread_local.set(local)
+        stack = getattr(local, "wstack", None)
+        if stack is None:
+            # ContextVar 会被 asyncio.to_thread 复制到工作线程，但 threading.local
+            # 的数据是按线程隔离的：新线程里需补建自己的栈，保证并发渲染互不干扰
+            stack = []
+            local.wstack = stack
+        stack.append(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         local = self._thread_local.get()
-        assert local is not None and local.wstack[-1] is self
-        local.wstack.pop()
-        if not local.wstack:
+        stack = getattr(local, "wstack", None) if local is not None else None
+        assert stack is not None and stack[-1] is self
+        stack.pop()
+        if not stack:
             self._thread_local.set(None)
 
     def add_item(self, item: 'Widget', index: int = None):
@@ -779,8 +803,15 @@ class ImageBox(Widget):
     def __init__(self, image: Union[str, Image.Image], image_size_mode=None, size=None,
                  use_alphablend=False, alpha_adjust=1.0):
         super().__init__()
-        if isinstance(image, str):
-            self.image = Image.open(image)
+        # 只有自己打开的图才由自己负责 close，调用方传入的内存图不动
+        self._owns_image = isinstance(image, str)
+        self.image: Optional[Image.Image] = None
+        if self._owns_image:
+            try:
+                self.image = Image.open(image)
+            except Exception as e:
+                # 损坏/不可识别的图：保留占位，不影响同一网格里的其他图
+                logger.warning(f"ImageBox 打开图片失败，已跳过该图: {image}: {e}")
         else:
             self.image = image
         if size:
@@ -793,6 +824,37 @@ class ImageBox(Widget):
         self.set_padding(0)
         self.use_alphablend = use_alphablend
         self.alpha_adjust = alpha_adjust
+        # 打开后先按展示尺寸缩略，避免整图（如 3000×2000）解码后一直驻留到绘制
+        self._prepare_image()
+
+    def _discard_image(self):
+        if self._owns_image and self.image is not None:
+            try:
+                self.image.close()
+            except Exception:
+                pass
+        self.image = None
+
+    def _prepare_image(self):
+        """按展示尺寸预缩略；缩略只会变小，不影响 fit/fill 的比例计算。"""
+        # 调用方传入的内存图不修改其内容（保持原有语义），只处理自己从文件打开的图
+        if not self._owns_image or self.image is None:
+            return
+        if self.image_size_mode == 'original':
+            return
+        if not (self.w or self.h):
+            return
+        try:
+            tw = (self.w - self.hpadding * 2) if self.w else 0
+            th = (self.h - self.vpadding * 2) if self.h else 0
+            w, h = self.image.size
+            if (tw and w > tw) or (th and h > th):
+                self.image.thumbnail(
+                    (tw or w, th or h), Image.Resampling.LANCZOS
+                )
+        except Exception as e:
+            logger.warning(f"ImageBox 读取图片失败，已跳过该图: {e}")
+            self._discard_image()
 
     def set_image_size_mode(self, mode: str):
         assert mode in ('fit', 'fill', 'original')
@@ -800,6 +862,9 @@ class ImageBox(Widget):
         return self
 
     def _get_content_size(self) -> Size:
+        if self.image is None:
+            # 打开失败：尺寸交给 set_size 指定的占位区域
+            return (0, 0)
         w, h = self.image.size
         if self.image_size_mode == 'original':
             return (w, h)
@@ -815,11 +880,24 @@ class ImageBox(Widget):
         return (int(w * scale), int(h * scale))
 
     def _draw_content(self, p: Painter):
-        w, h = self._get_content_size()
-        if self.use_alphablend:
-            p.paste_with_alphablend(self.image, (0, 0), (w, h), self.alpha_adjust)
-        else:
-            p.paste(self.image, (0, 0), (w, h))
+        image = self.image
+        if image is None:
+            return
+        try:
+            w, h = self._get_content_size()
+            if self.use_alphablend:
+                p.paste_with_alphablend(image, (0, 0), (w, h), self.alpha_adjust)
+            else:
+                p.paste(image, (0, 0), (w, h))
+        except Exception as e:
+            logger.warning(f"ImageBox 绘制图片失败，已跳过该图: {e}")
+        finally:
+            # 绘制完立即释放解码后的图；本组件只绘制一次（见 Widget.draw）
+            if self._owns_image:
+                try:
+                    image.close()
+                except Exception:
+                    pass
 
 
 class Spacer(Widget):
@@ -841,13 +919,21 @@ class Canvas(Frame):
         self.set_bg(bg)
         self.set_margin(0)
 
-    async def get_img(self, scale: float = None) -> Image.Image:
+    def get_img_sync(self, scale: float = None) -> Image.Image:
+        """同步渲染整张画布。
+
+        布局与绘制都是同步 PIL 操作，单独提供同步入口，便于调用方用
+        ``await asyncio.to_thread(canvas.get_img_sync)`` 把 CPU/IO 移出事件循环。
+        """
         size = self._get_self_size()
         p = Painter(size=size)
         self.draw(p)
-        img = await p.get()
+        img = p.img
         if scale and scale != 1.0:
             img = img.resize(
                 (int(size[0] * scale), int(size[1] * scale)), Image.Resampling.BILINEAR
             )
         return img
+
+    async def get_img(self, scale: float = None) -> Image.Image:
+        return self.get_img_sync(scale)

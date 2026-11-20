@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -37,6 +38,11 @@ from .image_utils import ImageProcessor, process_image_for_gallery
 
 # "以文件方式发送"的图片按扩展名识别：文件名/路径/链接带这些扩展名才尝试提取
 IMAGE_FILE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+# 单张网络图片下载超时（秒）与重试次数：避免一条慢链接（aiohttp 默认
+# total=300s）把整批上传和回执一起拖住
+IMAGE_DOWNLOAD_TIMEOUT = 20
+IMAGE_DOWNLOAD_RETRIES = 1
 
 
 class SilentPassException(Exception):
@@ -191,20 +197,25 @@ class GalleryPlugin(Star):
 
         AstrBot 的 message_str 已剥离唤醒前缀，这里再处理开头可选的 /，
         保证 /看 与 看 都能触发。
-        enable_slash_prefix=True(默认): /看 与 看 都生效；
-        enable_slash_prefix=False: 仅接受不带 / 的裸指令。
+        enable_slash_prefix 只影响 listen_all_messages 全消息监听模式：
+        开启时 /看 与 看 都生效；关闭时仅接受不带 / 的裸指令。
+        原生指令路径由 AstrBot 的 wake_prefix 决定，本开关管不到（见下方注释）。
         """
         text = (event.message_str or "").strip()
         if not text:
             return
 
         # 规范化前缀：去掉可选的 /
+        # 注意：原生指令路径上 AstrBot 在唤醒阶段已剥掉唤醒前缀（如 /），
+        # 插件看到的 has_slash 恒为 False，所以 enable_slash_prefix 实际只
+        # 对 listen_all_messages 的全消息监听模式生效；原生指令是否带 /
+        # 由 AstrBot 的 wake_prefix 配置决定，此处无法改变。
         has_slash = text.startswith("/")
         body = text[1:].strip() if has_slash else text
         if not body:
             return
 
-        # 关闭斜杠兼容时，拒绝带 / 的指令（只走裸指令）
+        # 关闭斜杠兼容时，拒绝带 / 的裸消息指令（只走裸指令）
         if not self.enable_slash_prefix and has_slash:
             return
 
@@ -233,15 +244,21 @@ class GalleryPlugin(Star):
             # 写操作（上传/gall 等）必须提示错误，否则表现为无响应难以排查
             yield event.plain_result(str(e))
         except GalleryPicRepeatedException as e:
+            # 查重命中是预期交互，直接回执，不记 error 日志
             yield event.plain_result(str(e))
         except AssertionError as e:
+            # 断言文案对用户有意义（如画廊名无效），保留回执并补日志
+            logger.warning(f"画廊指令断言失败 [{cmd}]: {e}")
             yield event.plain_result(str(e))
         except SilentPassException:
             # 「看」参数缺失/无法解析：群聊里极易误触发，静默放行不回复不拦截
             return
         except Exception as e:
-            logger.error(f"画廊指令处理出错 [{cmd}]: {get_exc_desc(e)}")
-            yield event.plain_result(f"处理出错: {e}")
+            # 异常原文可能带服务器绝对路径等信息，只进日志，群里回固定文案
+            logger.error(
+                f"画廊指令处理出错 [{cmd}]: {get_exc_desc(e)}", exc_info=True
+            )
+            yield event.plain_result("处理出错，已记录日志")
         event.stop_event()
 
     # 长指令必须排在短指令前面，避免「看所有」被拆成「看」+「所有」
@@ -257,17 +274,33 @@ class GalleryPlugin(Star):
         "gall",
     )
 
+    # 写操作类中文指令：指令名后必须有空白或到行尾才算命中。
+    # 否则「创建画廊了」会真建一个叫「了」的画廊并落盘、
+    # 「添加失败了」会被当成上传指令抢答普通群聊。查询类（看/看所有/看全部）
+    # 保持无空格前缀匹配，README 明确支持「看miku」这种写法。
+    _WRITE_COMMANDS = {
+        "上传", "添加",
+        "取消上传", "撤销上传", "回退上传",
+        "上传记录",
+        "创建画廊",
+        "添加别名",
+    }
+
     def _parse_cmd(self, body: str) -> tuple[str, str] | None:
         """从消息正文解析画廊指令。
 
         与原版 lunabot CmdHandler 一致：按最长前缀匹配，中文指令后可以不空格。
+        写操作类指令例外：指令名后必须是空白或行尾（见 _WRITE_COMMANDS）。
         ASCII 指令（gall）要求词边界，避免 gallery 误触发 gall。
         """
         for cmd in self._COMMANDS:
             if not body.startswith(cmd):
                 continue
             rest = body[len(cmd):]
-            if rest and cmd.isascii() and rest[0].isalnum():
+            if cmd in self._WRITE_COMMANDS:
+                if rest and not rest[0].isspace():
+                    continue
+            elif rest and cmd.isascii() and rest[0].isalnum():
                 continue
             return cmd, rest.strip()
         return None
@@ -602,128 +635,148 @@ class GalleryPlugin(Star):
     async def _cmd_add(self, event: AstrMessageEvent, args: str):
         """上传图片到画廊。force 关闭查重。"""
         check_duplicated = True
-        if "force" in args:
+        # 按空白分词识别 force：名字含 force 的画廊不应被误伤
+        tokens = args.split()
+        if "force" in tokens:
             check_duplicated = False
-            args = args.replace("force", "").strip()
-        name = args
+            tokens = [t for t in tokens if t != "force"]
+        name = " ".join(tokens)
         g = self.gallery_manager.find_gall(name, raise_if_nofound=True)
 
         if not event.is_admin() and g.mode != GalleryMode.Edit:
             raise ReplyException(f'画廊"{name}"不允许上传图片')
 
-        # 提取消息中的图片
-        image_urls = await self._extract_image_urls(event)
+        # 提取消息中的图片。stats 统计 url/file 都取不到、且无法转为本地
+        # 文件的图片组件数，这类图计入回执分母，避免「成功上传1/2」静默丢图
+        stats: dict[str, int] = {}
+        image_urls = await self._extract_image_urls(event, stats)
+        unrecognized = stats.get("unrecognized", 0)
         if not image_urls:
+            if unrecognized:
+                raise ReplyException(
+                    f"{unrecognized} 张图片无法识别，请重新以图片形式发送后再上传"
+                )
             raise ReplyException("请回复或附带至少一张图片后再上传")
 
+        total = len(image_urls) + unrecognized
         start_time = datetime.now()
         ok_list: list[int] = []
         err_msg = ""
         repeats: list[tuple[str, int]] = []  # (待上传图临时路径, 相似 pid)
+        paths: list[str] = []
 
-        # 并发下载/取本地路径
-        async def fetch_local(url: str) -> str:
-            try:
-                return await self._localize_image(url)
-            except Exception as e:
-                logger.warning(f"获取图片失败: {get_exc_desc(e)}")
-                return ""
+        try:
+            # 并发下载/取本地路径。超时与重试在 _localize_image/_download_image
+            # 内部处理，单张慢链接不会拖住整批上传和回执。
+            async def fetch_local(url: str) -> str:
+                try:
+                    return await self._localize_image(url)
+                except Exception as e:
+                    logger.warning(f"获取图片失败: {get_exc_desc(e)}")
+                    return ""
 
-        paths = await asyncio.gather(*[fetch_local(u) for u in image_urls])
+            paths = await asyncio.gather(*[fetch_local(u) for u in image_urls])
 
-        # AI 审核（配置启用时）。图片较多先提示等待，再并发送审；
-        # 审核服务异常或输出无法解析时降级放行，不阻塞上传。
-        review_results: list[tuple[bool, str] | None] = [None] * len(paths)
-        if self.ai_review_enable:
-            if len(paths) >= self.ai_review_notice_threshold:
-                yield event.plain_result(
-                    f"一次上传的图片较多（{len(paths)}张），"
-                    "正在进行 AI 审核，请耐心等待..."
-                )
-            to_review = [i for i, p in enumerate(paths) if p]
-            if to_review:
-                sem = asyncio.Semaphore(3)
+            # AI 审核（配置启用时）。图片较多先提示等待，再并发送审；
+            # 审核服务异常或输出无法解析时降级放行，不阻塞上传。
+            review_results: list[tuple[bool, str] | None] = [None] * len(paths)
+            if self.ai_review_enable:
+                if len(paths) >= self.ai_review_notice_threshold:
+                    yield event.plain_result(
+                        f"一次上传的图片较多（{len(paths)}张），"
+                        "正在进行 AI 审核，请耐心等待..."
+                    )
+                to_review = [i for i, p in enumerate(paths) if p]
+                if to_review:
+                    sem = asyncio.Semaphore(3)
 
-                async def _review_one(i: int):
-                    async with sem:
-                        review_results[i] = await self._ai_review_image(paths[i])
+                    async def _review_one(i: int):
+                        async with sem:
+                            review_results[i] = await self._ai_review_image(paths[i])
 
-                await asyncio.gather(*[_review_one(i) for i in to_review])
+                    await asyncio.gather(*[_review_one(i) for i in to_review])
 
-        for i, path in enumerate(paths, 1):
-            if not path or not os.path.exists(path):
-                err_msg += f"第{i}张图片下载失败\n"
-                continue
-            review = review_results[i - 1]
-            if review is not None and not review[0]:
-                err_msg += f"第{i}张图片未通过AI审核: {review[1] or '内容不合规'}\n"
-                continue
-            try:
-                await asyncio.to_thread(
-                    process_image_for_gallery, path, 1, self.size_limit_mb
-                )
-                # 处理可能转换了格式（静态图转 gif），对齐扩展名避免 QQ 按后缀误判
-                path = await asyncio.to_thread(self._fix_ext_by_format, path)
-                paths[i - 1] = path  # 同步回列表，保证清理阶段能删除
-                pid = await self.gallery_manager.async_add_pic(
-                    name,
-                    path,
-                    check_duplicated=check_duplicated,
-                    h1=self.hash1_threshold,
-                    h2=self.hash2_threshold,
-                )
-                ok_list.append(pid)
-                await self._append_add_log(event.get_sender_id(), pid, name)
-            except GalleryPicRepeatedException as e:
-                repeats.append((path, e.pid))
-            except Exception as e:
-                logger.error(f"上传第{i}张图片到画廊\"{name}\"失败: {get_exc_desc(e)}")
-                err_msg += f"第{i}张图片上传失败: {e}\n"
+            for i, path in enumerate(paths, 1):
+                if not path or not os.path.exists(path):
+                    err_msg += f"第{i}张图片下载失败\n"
+                    continue
+                review = review_results[i - 1]
+                if review is not None and not review[0]:
+                    err_msg += f"第{i}张图片未通过AI审核: {review[1] or '内容不合规'}\n"
+                    continue
+                try:
+                    await asyncio.to_thread(
+                        process_image_for_gallery, path, 1, self.size_limit_mb
+                    )
+                    # 处理可能转换了格式（静态图转 gif），对齐扩展名避免 QQ 按后缀误判
+                    path = await asyncio.to_thread(self._fix_ext_by_format, path)
+                    paths[i - 1] = path  # 同步回列表，保证清理阶段能删除
+                    pid = await self.gallery_manager.async_add_pic(
+                        name,
+                        path,
+                        check_duplicated=check_duplicated,
+                        h1=self.hash1_threshold,
+                        h2=self.hash2_threshold,
+                    )
+                    ok_list.append(pid)
+                    await self._append_add_log(event.get_sender_id(), pid, name)
+                except GalleryPicRepeatedException as e:
+                    repeats.append((path, e.pid))
+                except Exception as e:
+                    logger.error(f"上传第{i}张图片到画廊\"{name}\"失败: {get_exc_desc(e)}")
+                    err_msg += f"第{i}张图片上传失败: {e}\n"
 
-        cost = (datetime.now() - start_time).total_seconds()
-        logger.info(f'上传{len(ok_list)}/{len(image_urls)}张图片到画廊"{name}"完成, 耗时{cost:.2f}秒')
+            if unrecognized:
+                err_msg = f"{unrecognized} 张图片无法识别已跳过\n" + err_msg
 
-        hid = await self.history_manager.add_history(event.get_sender_id(), ok_list) if ok_list else None
+            cost = (datetime.now() - start_time).total_seconds()
+            logger.info(f'上传{len(ok_list)}/{total}张图片到画廊"{name}"完成, 耗时{cost:.2f}秒')
 
-        # 渲染重复对比图
-        repeat_img_path = None
-        if repeats:
-            pairs = []
-            for new_path, old_pid in repeats:
-                old_path = None
-                old_pic = self.gallery_manager.find_pic(old_pid, raise_if_nofound=False)
-                if old_pic and os.path.exists(old_pic.path):
-                    old_path = old_pic.path
-                pairs.append(
-                    {"new_path": new_path, "old_path": old_path, "old_pid": old_pid}
-                )
-            repeat_img_path = await image_utils.render_repeat(
-                pairs,
-                hint='查重错误可使用"/上传 画廊名 force"强制上传图片',
-                save_dir=self.tmp_dir,
-            )
+            hid = await self.history_manager.add_history(event.get_sender_id(), ok_list) if ok_list else None
 
-        msg = f'成功上传{len(ok_list)}/{len(image_urls)}张图片到"{name}"'
-        if ok_list:
-            msg += f"（表情编号: {' '.join(str(p) for p in ok_list)}）"
-        msg += "\n"
-        msg += err_msg
-        if repeats:
-            msg += f"{len(repeats)}张图片与已有图片重复"
-        msg += '\n主要收录表情/梗图，请勿上传可能有争议的图片（使用"/取消上传"回退）'
+            # 渲染重复对比图；渲染失败只降级为纯文本回执，不影响上传结果
+            repeat_img_path = None
+            if repeats:
+                pairs = []
+                for new_path, old_pid in repeats:
+                    old_path = None
+                    old_pic = self.gallery_manager.find_pic(old_pid, raise_if_nofound=False)
+                    if old_pic and os.path.exists(old_pic.path):
+                        old_path = old_pic.path
+                    pairs.append(
+                        {"new_path": new_path, "old_path": old_path, "old_pid": old_pid}
+                    )
+                try:
+                    repeat_img_path = await image_utils.render_repeat(
+                        pairs,
+                        hint='查重错误可使用"/上传 画廊名 force"强制上传图片',
+                        save_dir=self.tmp_dir,
+                    )
+                except Exception as e:
+                    logger.warning(f"渲染重复对比图失败，降级为纯文本回执: {get_exc_desc(e)}")
 
-        chain = [Comp.Plain(msg)]
-        if repeat_img_path:
-            chain.append(Comp.Image.fromFileSystem(repeat_img_path))
-        yield event.chain_result(chain)
+            msg = f'成功上传{len(ok_list)}/{total}张图片到"{name}"'
+            if ok_list:
+                msg += f"（表情编号: {' '.join(str(p) for p in ok_list)}）"
+            msg += "\n"
+            msg += err_msg
+            if repeats:
+                msg += f"{len(repeats)}张图片与已有图片重复"
+            msg += '\n主要收录表情/梗图，请勿上传可能有争议的图片（使用"/取消上传"回退）'
 
-        # 清理下载的临时文件（图片已拷贝到画廊目录或已渲染对比图）
-        for path in paths:
-            try:
-                if path and os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
+            chain = [Comp.Plain(msg)]
+            if repeat_img_path:
+                chain.append(Comp.Image.fromFileSystem(repeat_img_path))
+            yield event.chain_result(chain)
+        finally:
+            # 成功/异常/超时都清理本次下载的临时文件
+            # （图片已拷贝到画廊目录或已渲染对比图）
+            for path in paths:
+                try:
+                    if path and os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
 
     async def _cmd_cancel(self, event: AstrMessageEvent, args: str):
         """撤销上传：无参数撤销自己最近一次；管理员可指定记录 id。"""
@@ -804,8 +857,9 @@ class GalleryPlugin(Star):
         """添加画廊别名（所有用户可用）。"""
         async with self.gallery_manager._lock:
             self.gallery_manager.add_gall_alias(gall_name, alias)
-            yield event.plain_result(f'画廊"{gall_name}"添加别名"{alias}"成功')
+            # 先落库再回执：_save 失败时不向用户报告成功
             await self.gallery_manager._save()
+            yield event.plain_result(f'画廊"{gall_name}"添加别名"{alias}"成功')
 
     async def _gall_mode(self, event: AstrMessageEvent, args: str, is_admin: bool):
         """查看或设置画廊模式。"""
@@ -843,23 +897,25 @@ class GalleryPlugin(Star):
 
     async def _gall_del(self, event: AstrMessageEvent, args: str):
         """批量删除图片。"""
-        l, r = None, None
+        args = args.strip()
+        # 只有单个「数字-数字」token 才按区间解析（中间不能有空格），
+        # 避免把 /gall del 1 -2 里的负 pid 当成区间 1..2；
+        # 其余按空白分词逐个 int（支持负数）
+        m = re.fullmatch(r"(\d+)-(\d+)", args)
+        usage = "使用方式:\n/gall del 123 456 -1 -2 ...\n/gall del 123-456 (最多连续20张)"
         try:
-            if "-" in args:
-                l_str, r_str = args.split("-", 1)
-                l, r = int(l_str), int(r_str)
-                pids = list(range(l, r + 1))
+            if m:
+                l, r = int(m.group(1)), int(m.group(2))
+                # 先按起止校验张数再展开 range，避免超大区间分配 GB 级列表
+                if r >= l and r - l + 1 > 20:
+                    raise ReplyException("一次最多删除20张连续图片")
+                pids = list(range(l, r + 1)) if r >= l else []
             else:
                 pids = [int(s) for s in args.split()]
-            assert pids
-        except Exception:
-            raise ReplyException(
-                "使用方式:\n/gall del 123 456 -1 -2 ...\n/gall del 123-456 (最多连续20张)"
-            )
-
-        if l is not None:
-            if r - l >= 20:
-                raise ReplyException("一次最多删除20张连续图片")
+        except ValueError:
+            raise ReplyException(usage)
+        if not pids:
+            raise ReplyException(usage)
         # 禁止跨画廊删除
         gall_names = set()
         for pid in pids:
@@ -869,16 +925,7 @@ class GalleryPlugin(Star):
         if len(gall_names) > 1:
             raise ReplyException("禁止跨画廊删除图片")
 
-        ok_list, err_list = [], []
-        async with self.gallery_manager._lock:
-            for pid in pids:
-                try:
-                    deleted = self.gallery_manager.del_pic(pid)
-                    ok_list.append(deleted)
-                except Exception as e:
-                    logger.warning(f"删除画廊图片pid={pid}失败: {get_exc_desc(e)}")
-                    err_list.append(pid)
-            await self.gallery_manager._save()
+        ok_list, err_list = await self.gallery_manager.async_del_pics(pids)
 
         msg = ""
         if ok_list:
@@ -942,28 +989,37 @@ class GalleryPlugin(Star):
         except ValueError:
             raise ReplyException("使用方式: /gall log pid")
         log_path = os.path.join(self.data_dir, "add.log")
-        if os.path.exists(log_path):
+
+        def read_lines() -> list[str]:
+            if not os.path.exists(log_path):
+                return []
             with open(log_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-        else:
-            lines = []
+                return f.readlines()
+
+        # 日志可能很大，读取放到线程里，避免阻塞事件循环
+        lines = await asyncio.to_thread(read_lines)
+        # 精确匹配 pid=1，避免子串命中 pid=10/100 的记录
+        pattern = re.compile(r"\bpid=(\d+)\b")
         for line in lines:
-            if f"pid={pid}" in line:
+            found = pattern.search(line)
+            if found and int(found.group(1)) == pid:
                 yield event.plain_result(line.strip())
                 return
         raise ReplyException(f"pid={pid}的上传记录不存在")
 
     async def _gall_replace(self, event: AstrMessageEvent, args: str):
-        """替换指定 pid 图片。修复原版 args.remove('force') bug。"""
-        # 修复：字符串没有 .remove() 方法，使用 replace
+        """替换指定 pid 图片。force 关闭查重。"""
+        # 按空白分词识别 force：名字/参数里含 force 时不应误判为强制，
+        # 原版字符串 replace('force', '') 是按子串删除
         check_duplicated = True
-        if "force" in args:
+        tokens = args.split()
+        if "force" in tokens:
             check_duplicated = False
-            args = args.replace("force", "").strip()
+            tokens = [t for t in tokens if t != "force"]
         try:
-            pid = int(args)
+            pid = int(" ".join(tokens))
         except ValueError:
-            raise ReplyException("使用方式: /gall replace pid")
+            raise ReplyException("使用方式: /gall replace pid [force]")
 
         image_urls = await self._extract_image_urls(event)
         if not image_urls:
@@ -1009,6 +1065,26 @@ class GalleryPlugin(Star):
             return True
         return os.path.exists(src)
 
+    async def _download_image(self, src: str) -> str:
+        """下载网络图片：单张超时 + 一次重试。
+
+        aiohttp 默认 total=300s，一条慢链接会让整批上传和回执一起卡住，
+        这里用 asyncio.wait_for 给单张下载封顶。
+        """
+        last_exc: Exception | None = None
+        for attempt in range(IMAGE_DOWNLOAD_RETRIES + 1):
+            try:
+                return await asyncio.wait_for(
+                    download_image_by_url(src), timeout=IMAGE_DOWNLOAD_TIMEOUT
+                )
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    f"下载图片失败(第{attempt + 1}/{IMAGE_DOWNLOAD_RETRIES + 1}次): "
+                    f"{get_exc_desc(e)}"
+                )
+        raise last_exc
+
     async def _localize_image(self, src: str) -> str:
         """把图片来源（网络 URL / file:/// / 本地路径 / base64）统一转为本地文件路径。
 
@@ -1023,7 +1099,7 @@ class GalleryPlugin(Star):
                 self._copy_with_correct_ext, os.path.abspath(src[8:])
             )
         if src.startswith(("http://", "https://")):
-            local = await download_image_by_url(src)
+            local = await self._download_image(src)
             return await asyncio.to_thread(self._fix_ext_by_format, local)
         if src.startswith("base64://"):
             import base64 as _b64
@@ -1042,7 +1118,7 @@ class GalleryPlugin(Star):
                 self._copy_with_correct_ext, os.path.abspath(src)
             )
         # 兜底：尝试当 URL 下载（例如没带 http 前缀的链接）
-        local = await download_image_by_url(src)
+        local = await self._download_image(src)
         return await asyncio.to_thread(self._fix_ext_by_format, local)
 
     def _copy_with_correct_ext(self, path: str) -> str:
@@ -1126,15 +1202,40 @@ class GalleryPlugin(Star):
         return passed, reason
 
     @staticmethod
+    def _review_pass_to_bool(value) -> bool | None:
+        """把 AI 输出里的 pass 字段转成布尔；无法识别返回 None。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v == "true":
+                return True
+            if v == "false":
+                return False
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        return None
+
+    @staticmethod
     def _parse_review_result(text: str) -> tuple[bool, str]:
-        """解析模型审核输出；无法解析时放行。"""
+        """解析模型审核输出。
+
+        pass 字段严格解析：bool 直接使用；"true"/"false"（大小写不敏感）
+        与数字 1/0 转布尔。字段缺失或无法识别时按「解析失败」放行
+        （保持 fail-open），并记录原始输出——避免 bool("false") 把拒绝判成通过。
+        """
         m = re.search(r"\{[^{}]*\}", text, re.S)
         if m:
             try:
                 data = json.loads(m.group(0))
-                return bool(data.get("pass", True)), str(data.get("reason") or "")
             except Exception:
-                pass
+                data = None
+            if isinstance(data, dict) and "pass" in data:
+                passed = GalleryPlugin._review_pass_to_bool(data.get("pass"))
+                if passed is not None:
+                    return passed, str(data.get("reason") or "")
+                logger.warning(f"AI审核输出 pass 字段无法识别，按放行处理: {text[:200]}")
+                return True, ""
         lowered = text.lower()
         if (
             '"pass": false' in lowered
@@ -1142,38 +1243,58 @@ class GalleryPlugin(Star):
             or "不通过" in text
         ):
             return False, text[:100]
+        logger.warning(f"AI审核输出无法解析，按放行处理: {text[:200]}")
         return True, ""
 
-    async def _extract_image_urls(self, event: AstrMessageEvent) -> list[str]:
+    async def _extract_image_urls(
+        self, event: AstrMessageEvent, stats: dict | None = None
+    ) -> list[str]:
         """从消息中提取图片 URL。
 
         支持：直接图片、引用消息(Reply.chain)、合并转发消息——
         包括内联 Node/Nodes 节点与 Forward（通过 get_forward_msg API 拉取内容）。
+
+        stats 不为 None 时写入 "unrecognized"：url/file 都取不到、且无法
+        转为本地文件的 Image 组件数（供上传回执如实展示跳过张数）。
         """
         urls: list[str] = []
+        unrecognized = 0
         seen_forward_ids: set[str] = set()
         seen_reply_ids: set[str] = set()
-        if not event.message_obj or not event.message_obj.message:
-            return urls
 
-        def image_url_of(comp) -> str | None:
+        async def image_url_of(comp) -> str | None:
             url = getattr(comp, "url", None)
             if self._is_fetchable_src(url):
                 return url
             file = getattr(comp, "file", None)
             if self._is_fetchable_src(file):
                 return file
+            # url/file 都不可用（部分协议端只给图片 ID）：让组件自己落成本地文件，
+            # 避免整张图被静默丢弃、回执却显示上传成功
+            convert = getattr(comp, "convert_to_file_path", None)
+            if callable(convert):
+                try:
+                    path = convert()
+                    if inspect.isawaitable(path):
+                        path = await path
+                    if self._is_fetchable_src(path):
+                        return path
+                except Exception as e:
+                    logger.warning(f"图片组件转本地文件失败: {get_exc_desc(e)}")
             return None
 
         async def walk(comps: list, depth: int):
+            nonlocal unrecognized
             if depth > 4:
                 return
             for comp in comps:
                 try:
                     if isinstance(comp, Comp.Image):
-                        url = image_url_of(comp)
+                        url = await image_url_of(comp)
                         if url:
                             urls.append(url)
+                        else:
+                            unrecognized += 1
                     elif isinstance(comp, Comp.File):
                         # QQ"以文件方式发送"的图片以 File 组件到达
                         src = await self._src_of_file_comp(event, comp)
@@ -1183,6 +1304,7 @@ class GalleryPlugin(Star):
                         rid = getattr(comp, "id", None)
                         chain = getattr(comp, "chain", None)
                         before = len(urls)
+                        before_unrecognized = unrecognized
                         if chain:
                             await walk(chain, depth + 1)
                         if len(urls) == before and rid and str(rid) not in seen_reply_ids:
@@ -1194,6 +1316,10 @@ class GalleryPlugin(Star):
                             urls.extend(
                                 await self._urls_from_raw_segments(event, segments)
                             )
+                            if len(urls) > before:
+                                # get_msg 兜底拿到了原图：chain 里识别失败的组件
+                                # 已从中恢复，不再计为「无法识别」
+                                unrecognized = before_unrecognized
                     elif isinstance(comp, Comp.Node):
                         content = getattr(comp, "content", None)
                         if content:
@@ -1215,7 +1341,10 @@ class GalleryPlugin(Star):
                 except Exception as e:
                     logger.warning(f"提取图片组件失败: {get_exc_desc(e)}")
 
-        await walk(event.message_obj.message, 0)
+        if event.message_obj and event.message_obj.message:
+            await walk(event.message_obj.message, 0)
+        if stats is not None:
+            stats["unrecognized"] = stats.get("unrecognized", 0) + unrecognized
         return urls
 
     async def _fetch_forward_segments(self, event: AstrMessageEvent, forward_id) -> list:

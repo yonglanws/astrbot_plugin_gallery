@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
-from .gallery_manager import ReplyException, get_exc_desc
+from .gallery_manager import (
+    ReplyException,
+    get_exc_desc,
+    quarantine_corrupt_file,
+)
 
 if TYPE_CHECKING:
     from .gallery_manager import GalleryManager
@@ -41,21 +45,109 @@ class HistoryManager:
         self._loaded = False
 
     def _load(self) -> None:
-        if os.path.exists(self._db_path):
-            try:
-                with open(self._db_path, "r", encoding="utf-8") as f:
-                    db = json.load(f)
-            except Exception as e:
-                logger.error(f"读取上传历史失败，将重建: {e}")
-                db = {}
-        else:
-            db = {}
-        self._history = db.get("history", [])
-        self._next_id = db.get("next_id", 1)
-        # 兜底：若历史中有 id 超过 next_id，则对齐
-        for h in self._history:
-            if h["id"] >= self._next_id:
-                self._next_id = h["id"] + 1
+        self._history = []
+        self._next_id = 1
+
+        if not os.path.exists(self._db_path):
+            return
+
+        try:
+            with open(self._db_path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # 解析失败不能静默变空历史：先把坏文件改名留档，避免下次 _save 覆盖唯一副本
+            backup = quarantine_corrupt_file(self._db_path, "上传历史")
+            logger.error(
+                f"上传历史文件损坏，已备份为 {backup or '(备份失败)'}，以空历史启动: {e}"
+            )
+            return
+        except Exception as e:
+            logger.error(
+                f"读取上传历史失败，以空历史启动（保留原文件）: {get_exc_desc(e)}"
+            )
+            return
+
+        # 结构解析整体兜底：任何意外都不能让 initialize 失败
+        try:
+            if not isinstance(db, dict):
+                raise ValueError(f"历史文件根节点应为对象，实际为 {type(db).__name__}")
+
+            raw_next = db.get("next_id", 1)
+            if (
+                isinstance(raw_next, int)
+                and not isinstance(raw_next, bool)
+                and raw_next > 0
+            ):
+                self._next_id = raw_next
+            else:
+                logger.warning(f"上传历史 next_id={raw_next!r} 非法，重置为 1")
+
+            raw_history = db.get("history", [])
+            if not isinstance(raw_history, list):
+                raise ValueError("history 字段应为数组")
+
+            max_id = 0
+            for idx, item in enumerate(raw_history):
+                rec = self._normalize_record(item)
+                if rec is None:
+                    logger.warning(f"跳过非法上传历史记录 #{idx}: {item!r}")
+                    continue
+                self._history.append(rec)
+                if rec["id"] > max_id:
+                    max_id = rec["id"]
+
+            # 兜底：若历史中有 id 不低于 next_id，则对齐，避免复用 id
+            if max_id >= self._next_id:
+                if self._next_id > 1:
+                    logger.warning(
+                        f"上传历史 next_id={self._next_id} 不大于最大记录 id={max_id}，已修正"
+                    )
+                self._next_id = max_id + 1
+        except Exception as e:
+            logger.error(
+                f"解析上传历史失败，保留已加载的 {len(self._history)} 条记录: "
+                f"{get_exc_desc(e)}"
+            )
+
+    @staticmethod
+    def _normalize_record(item: object) -> dict | None:
+        """校验并规范化单条历史记录；缺 id 等非法记录返回 None。"""
+        if not isinstance(item, dict):
+            return None
+
+        hid = item.get("id")
+        if not isinstance(hid, int) or isinstance(hid, bool) or hid <= 0:
+            return None
+
+        pids = item.get("pids", [])
+        if not isinstance(pids, list) or not all(
+            isinstance(p, int) and not isinstance(p, bool) for p in pids
+        ):
+            logger.warning(f"上传历史#{hid} 的 pids 非法，已跳过该记录")
+            return None
+
+        uid = item.get("uid", "")
+        if not isinstance(uid, str):
+            logger.warning(f"上传历史#{hid} 的 uid 非法，已转为字符串")
+            uid = str(uid)
+
+        ts = item.get("ts", 0)
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            logger.warning(f"上传历史#{hid} 的 ts 非法，已置 0（视为已过期）")
+            ts = 0
+
+        reverted = item.get("reverted", False)
+        if not isinstance(reverted, bool):
+            logger.warning(f"上传历史#{hid} 的 reverted 非法，已置 False")
+            reverted = False
+
+        return {
+            "id": hid,
+            "uid": uid,
+            "pids": pids,
+            "ts": float(ts),
+            "reverted": reverted,
+        }
 
     def _save_sync(self) -> None:
         os.makedirs(os.path.dirname(self._db_path), exist_ok=True)

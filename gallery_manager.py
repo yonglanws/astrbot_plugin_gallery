@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -44,6 +45,11 @@ def _filename_only(value: str | None) -> str:
     if not value:
         return ""
     return os.path.basename(value.replace("\\", "/"))
+
+
+def _is_valid_pid(value: object) -> bool:
+    """图片 id 必须是正整数（bool 是 int 子类，需排除）。"""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 class GalleryMode(Enum):
@@ -194,7 +200,12 @@ class Gallery:
 
     @property
     def pics_dir(self) -> str:
-        return os.path.join(self._data_dir, PICS_SUBDIR, self.name)
+        # 解析成真实路径，并要求它正好是 data/pics/<name>（父目录必须是 pics/），
+        # 防止旧数据里的 "." / ".." / 带分隔符的名字把读写引到插件数据目录甚至更外层。
+        root = os.path.realpath(os.path.join(self._data_dir, PICS_SUBDIR))
+        path = os.path.realpath(os.path.join(root, self.name))
+        assert os.path.dirname(path) == root, f'画廊"{self.name}"的图片目录越界: {path}'
+        return path
 
     def to_dict(self) -> dict:
         return {
@@ -226,31 +237,168 @@ class GalleryManager:
     def _load(self) -> None:
         import json
 
-        if os.path.exists(self._db_path):
-            try:
-                with open(self._db_path, "r", encoding="utf-8") as f:
-                    db = json.load(f)
-            except Exception as e:
-                logger.error(f"读取画廊数据库失败，将重建: {e}")
-                db = {}
-        else:
-            db = {}
-        self.pid_top = db.get("pid_top", 0)
         self.galleries = {}
-        for name, g in db.get("galleries", {}).items():
-            gall_name = g.get("name") or name
-            self.galleries[name] = Gallery(
-                name=gall_name,
-                aliases=g.get("aliases", []),
-                cover_pid=g.get("cover_pid"),
-                mode=GalleryMode(g.get("mode", "edit")),
-                pics=[
-                    GalleryPic.load(p, gall_name, self._data_dir)
-                    for p in g.get("pics", [])
-                ],
-                _data_dir=self._data_dir,
+        self.pid_top = 0
+
+        if not os.path.exists(self._db_path):
+            logger.info("画廊数据库不存在，使用空库")
+            return
+
+        try:
+            with open(self._db_path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # 解析失败不能静默变空库：先把坏文件改名留档，避免下一次 _save 覆盖唯一副本
+            backup = quarantine_corrupt_file(self._db_path, "画廊数据库")
+            logger.error(
+                f"画廊数据库损坏，已备份为 {backup or '(备份失败)'}，以空库启动: {e}"
             )
-        logger.info(f"成功加载 {len(self.galleries)} 个画廊, pid_top={self.pid_top}")
+            return
+        except Exception as e:
+            logger.error(
+                f"读取画廊数据库失败，以空库启动（保留原文件）: {get_exc_desc(e)}"
+            )
+            return
+
+        # 结构解析同样整体兜底：任何意外都不能让 initialize 失败
+        try:
+            if not isinstance(db, dict):
+                raise ValueError(f"数据库根节点应为对象，实际为 {type(db).__name__}")
+
+            raw_pid_top = db.get("pid_top", 0)
+            if (
+                isinstance(raw_pid_top, int)
+                and not isinstance(raw_pid_top, bool)
+                and raw_pid_top >= 0
+            ):
+                self.pid_top = raw_pid_top
+            else:
+                logger.warning(f"画廊数据库 pid_top={raw_pid_top!r} 非法，重置为 0")
+
+            raw_galls = db.get("galleries", {})
+            if not isinstance(raw_galls, dict):
+                raise ValueError("galleries 字段应为对象")
+
+            max_pid = 0
+            for key, raw_g in raw_galls.items():
+                gallery = self._load_gall_record(str(key), raw_g)
+                if gallery is None:
+                    continue
+                if gallery.name in self.galleries:
+                    logger.warning(f'画廊名称"{gallery.name}"重复，后者覆盖前者')
+                self.galleries[gallery.name] = gallery
+                for pic in gallery.pics:
+                    if pic.pid > max_pid:
+                        max_pid = pic.pid
+
+            # pid_top 必须大于所有已加载图片的 pid，否则新图会和旧图撞 id
+            if max_pid > self.pid_top:
+                if self.pid_top:
+                    logger.warning(
+                        f"pid_top={self.pid_top} 小于已加载的最大图片 pid={max_pid}，已修正"
+                    )
+                self.pid_top = max_pid
+
+            logger.info(f"成功加载 {len(self.galleries)} 个画廊, pid_top={self.pid_top}")
+        except Exception as e:
+            logger.error(
+                f"解析画廊数据库失败，保留已加载的 {len(self.galleries)} 个画廊: "
+                f"{get_exc_desc(e)}"
+            )
+
+    def _load_gall_record(self, key: str, raw: object) -> "Gallery | None":
+        """解析单条画廊记录；结构或 mode 非法时跳过该记录并告警。"""
+        if not isinstance(raw, dict):
+            logger.warning(f'跳过非法的画廊记录 "{key}": 不是对象')
+            return None
+
+        name = raw.get("name") or key
+        if not isinstance(name, str) or not name:
+            logger.warning(f'跳过非法的画廊记录 "{key}": 名称为空')
+            return None
+
+        try:
+            mode = GalleryMode(raw.get("mode", "edit"))
+        except (TypeError, ValueError):
+            logger.warning(f'跳过画廊 "{name}": mode={raw.get("mode")!r} 非法')
+            return None
+
+        aliases = raw.get("aliases", [])
+        if not isinstance(aliases, list) or not all(isinstance(a, str) for a in aliases):
+            logger.warning(f'画廊 "{name}" 的 aliases 非法，已忽略')
+            aliases = []
+
+        cover_pid = raw.get("cover_pid")
+        if cover_pid is not None and not _is_valid_pid(cover_pid):
+            logger.warning(f'画廊 "{name}" 的 cover_pid={cover_pid!r} 非法，已忽略')
+            cover_pid = None
+
+        raw_pics = raw.get("pics", [])
+        if not isinstance(raw_pics, list):
+            logger.warning(f'画廊 "{name}" 的 pics 字段非法，按空画廊处理')
+            raw_pics = []
+
+        pics: list[GalleryPic] = []
+        for idx, raw_pic in enumerate(raw_pics):
+            pic = self._load_pic_record(name, raw_pic)
+            if pic is None:
+                logger.warning(f'画廊 "{name}" 跳过非法图片记录 #{idx}: {raw_pic!r}')
+                continue
+            pics.append(pic)
+
+        if not self._check_name(name):
+            # 旧数据可能含 "." / ".." 等非法名称：允许加载查看，
+            # 但 open/close 等会改动目录的操作会被拒绝。
+            logger.warning(f'画廊 "{name}" 名称非法（旧数据），已加载但禁止新建/删除目录')
+
+        return Gallery(
+            name=name,
+            aliases=aliases,
+            mode=mode,
+            cover_pid=cover_pid,
+            pics=pics,
+            _data_dir=self._data_dir,
+        )
+
+    def _load_pic_record(self, gall_name: str, raw: object) -> "GalleryPic | None":
+        """解析单条图片记录；缺 pid / 文件名为空等非法记录返回 None。"""
+        if not isinstance(raw, dict):
+            return None
+
+        pid = raw.get("pid")
+        if not _is_valid_pid(pid):
+            return None
+
+        raw_file = raw.get("file")
+        if not isinstance(raw_file, str) or not raw_file:
+            raw_file = raw.get("path")
+        if not isinstance(raw_file, str):
+            return None
+        file = _filename_only(raw_file)
+        if not file:
+            return None
+
+        raw_gall = raw.get("gall_name") or gall_name
+        if not isinstance(raw_gall, str):
+            return None
+
+        hash1 = raw.get("hash1")
+        if hash1 is not None and not isinstance(hash1, str):
+            logger.warning(f"画廊图片 pid={pid} 的 hash1 非法，已重置")
+            hash1 = None
+        hash2 = raw.get("hash2")
+        if hash2 is not None and not isinstance(hash2, str):
+            logger.warning(f"画廊图片 pid={pid} 的 hash2 非法，已重置")
+            hash2 = None
+
+        return GalleryPic(
+            gall_name=raw_gall,
+            pid=pid,
+            file=file,
+            hash1=hash1,
+            hash2=hash2,
+            _data_dir=self._data_dir,
+        )
 
     def _save_sync(self) -> None:
         import json
@@ -279,10 +427,16 @@ class GalleryManager:
 
     @staticmethod
     def _check_name(name: str) -> bool:
-        """画廊名/别名合法性校验（避免文件名注入与歧义）。"""
-        if not name or len(name) > 32:
+        """画廊名/别名合法性校验（避免文件名注入与目录穿越）。"""
+        if not isinstance(name, str) or not name or len(name) > 32:
+            return False
+        # "." / ".." 以及首尾带点：Windows 会吞掉结尾的点，且 "."/".." 会指向父目录
+        if name in (".", "..") or name.startswith(".") or name.endswith("."):
             return False
         if any(c in name for c in r'\/:*?"<>| '):
+            return False
+        # 控制字符（换行、NUL 等）会让文件名/日志不可控
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in name):
             return False
         if name.isdigit():
             return False
@@ -321,15 +475,32 @@ class GalleryManager:
         os.makedirs(g.pics_dir, exist_ok=True)
         self.galleries[name] = g
 
+    def _safe_pics_dir(self, name: str) -> str | None:
+        """返回 data/pics/<name> 的真实路径；名称非法或目录越界时返回 None。"""
+        if not self._check_name(name):
+            return None
+        root = os.path.realpath(os.path.join(self._data_dir, PICS_SUBDIR))
+        target = os.path.realpath(os.path.join(root, name))
+        if os.path.dirname(target) != root or os.path.basename(target) != name:
+            return None
+        return target
+
     def close_gall(self, name_or_alias: str) -> None:
         g = self.find_gall(name_or_alias, raise_if_nofound=True)
-        self.galleries.pop(g.name)
-        # 尝试删除图片目录
-        try:
-            if os.path.isdir(g.pics_dir):
-                shutil.rmtree(g.pics_dir, ignore_errors=True)
-        except Exception as e:
-            logger.warning(f'删除画廊 {g.name} 目录失败: {e}')
+        # 删除前再次独立校验（不依赖 pics_dir 属性）：realpath 必须正好是
+        # data/pics/<name>，否则旧数据里的 "." / ".." 会删掉整个 pics 甚至数据目录。
+        target = self._safe_pics_dir(g.name)
+        if target is None:
+            logger.warning(
+                f'画廊"{g.name}"名称非法，跳过删除图片目录（仅移除画廊记录）'
+            )
+        else:
+            try:
+                if os.path.isdir(target):
+                    shutil.rmtree(target)
+            except Exception as e:
+                logger.warning(f'删除画廊 {g.name} 目录失败: {e}')
+        self.galleries.pop(g.name, None)
 
     def add_gall_alias(self, name_or_alias: str, alias: str) -> None:
         assert self._check_name(alias), f'别名"{alias}"无效'
@@ -455,48 +626,134 @@ class GalleryManager:
                     if sim_pid != pid:
                         raise GalleryPicRepeatedException(sim_pid)
 
-            # 删除旧文件
-            try:
-                if os.path.exists(p.path):
-                    os.remove(p.path)
-                if p.thumb_path and os.path.exists(p.thumb_path):
-                    os.remove(p.thumb_path)
-            except Exception as e:
-                logger.warning(f"删除画廊图片 {pid} 文件失败: {get_exc_desc(e)}")
-
+            # 旧图不能先删：先拷到画廊目录内的临时文件，确认成功后再原子替换目标名。
+            # 任何一步失败都清理临时文件并保留旧图。
+            old_path = p.path
+            old_thumb = p.thumb_path
             _, ext = os.path.splitext(os.path.basename(img_path))
             time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             dst_path = os.path.join(g.pics_dir, f"{time_str}_{p.pid}{ext}")
-            await asyncio.to_thread(shutil.copy2, img_path, dst_path)
 
+            fd, tmp_path = await asyncio.to_thread(
+                tempfile.mkstemp,
+                prefix=f".replace-{p.pid}-",
+                suffix=".tmp",
+                dir=g.pics_dir,
+            )
+            os.close(fd)
+            try:
+                await asyncio.to_thread(shutil.copy2, img_path, tmp_path)
+                if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 0:
+                    raise OSError("拷贝替换图片后临时文件不存在或为空")
+                await asyncio.to_thread(os.replace, tmp_path, dst_path)
+            except Exception:
+                try:
+                    if os.path.exists(tmp_path):
+                        await asyncio.to_thread(os.remove, tmp_path)
+                except Exception as e:
+                    logger.warning(
+                        f"清理替换临时文件 {tmp_path} 失败: {get_exc_desc(e)}"
+                    )
+                raise
+
+            # 新图已落盘，才更新内存、重建缩略图并保存
             p.path = dst_path
             p.hash1 = new_pic.hash1
             p.hash2 = new_pic.hash2
-            p.thumb_path = None
+            # 旧缩略图必须先删掉；新旧文件名相同时否则会留下旧缩略图
+            try:
+                if old_thumb and os.path.exists(old_thumb):
+                    os.remove(old_thumb)
+            except Exception as e:
+                logger.warning(f"删除画廊图片 {pid} 旧缩略图失败: {get_exc_desc(e)}")
             await asyncio.to_thread(p.ensure_thumb)
             await self._save()
+            # 落库成功后再删旧图：即使此处失败，JSON 也不会指向已删除的文件
+            try:
+                if (
+                    os.path.abspath(old_path) != os.path.abspath(dst_path)
+                    and os.path.exists(old_path)
+                ):
+                    os.remove(old_path)
+            except Exception as e:
+                logger.warning(f"删除画廊图片 {pid} 旧图失败: {get_exc_desc(e)}")
             return p.pid
 
-    def del_pic(self, pid: int) -> int:
-        """删除画廊中的一张图片，返回被删除的图片 ID（同步，需持有 _lock 调用）。"""
-        p = self.find_pic(pid, raise_if_nofound=True)
-        g = self.find_gall(p.gall_name, raise_if_nofound=True)
-        g.pics.remove(p)
+    @staticmethod
+    def _remove_pic_files(p: GalleryPic) -> None:
+        """删除图片及其缩略图；失败只记 warning，不影响已落库的删除结果。"""
         try:
             if os.path.exists(p.path):
                 os.remove(p.path)
             if p.thumb_path and os.path.exists(p.thumb_path):
                 os.remove(p.thumb_path)
         except Exception as e:
-            logger.warning(f"删除画廊图片 {pid} 文件失败: {get_exc_desc(e)}")
+            logger.warning(f"删除画廊图片 {p.pid} 文件失败: {get_exc_desc(e)}")
+
+    def del_pic(self, pid: int) -> int:
+        """删除画廊中的一张图片，返回被删除的图片 ID（同步，需持有 _lock 调用）。
+
+        注意：该接口给 history.py 撤销上传复用，仍是先删文件后由调用方落库；
+        需要「落库成功后再删文件」的语义请用 async_del_pics。
+        """
+        p = self.find_pic(pid, raise_if_nofound=True)
+        g = self.find_gall(p.gall_name, raise_if_nofound=True)
+        g.pics.remove(p)
+        self._remove_pic_files(p)
         return p.pid
 
     async def async_del_pic(self, pid: int) -> int:
-        """异步删除图片（加锁 + 落库）。"""
+        """异步删除图片（加锁 + 落库，落库成功后才删文件）。"""
         async with self._lock:
-            deleted = self.del_pic(pid)
-            await self._save()
-            return deleted
+            p = self.find_pic(pid, raise_if_nofound=True)
+            g = self.find_gall(p.gall_name, raise_if_nofound=True)
+            idx = g.pics.index(p)
+            g.pics.remove(p)
+            try:
+                await self._save()
+            except Exception:
+                # 落库失败：恢复内存，避免内存与 JSON 不一致
+                g.pics.insert(idx, p)
+                raise
+            self._remove_pic_files(p)
+            return p.pid
+
+    async def async_del_pics(self, pids: list[int]) -> tuple[list[int], list[int]]:
+        """批量删除画廊图片，返回 (成功 pids, 失败 pids)。
+
+        锁内只改内存并落库，_save 成功后才删磁盘文件：即使删文件失败，
+        JSON 也不会指向已删除的文件。单张失败不影响其它张（与 main.py
+        原先逐张 try/except 的行为一致），失败原因记 warning。
+        """
+        ok_list: list[int] = []
+        err_list: list[int] = []
+        async with self._lock:
+            # (画廊, 原下标, 图片)，用于落库失败时按原顺序放回
+            removed: list[tuple[Gallery, int, GalleryPic]] = []
+            for pid in pids:
+                try:
+                    p = self.find_pic(pid, raise_if_nofound=True)
+                    g = self.find_gall(p.gall_name, raise_if_nofound=True)
+                    idx = g.pics.index(p)
+                    g.pics.remove(p)
+                    removed.append((g, idx, p))
+                    ok_list.append(p.pid)
+                except Exception as e:
+                    logger.warning(f"删除画廊图片pid={pid}失败: {get_exc_desc(e)}")
+                    err_list.append(pid)
+            if not removed:
+                return ok_list, err_list
+            try:
+                await self._save()
+            except Exception:
+                # 落库失败：恢复内存，避免「内存已删、JSON 仍有记录」
+                for g, idx, p in reversed(removed):
+                    g.pics.insert(idx, p)
+                raise
+            # 落库成功后再删文件；删文件失败只记 warning
+            for _, _, p in removed:
+                self._remove_pic_files(p)
+        return ok_list, err_list
 
     async def async_reload_gall(
         self, name_or_alias: str
@@ -549,35 +806,102 @@ class GalleryManager:
     async def async_check_gallery(
         self, name_or_alias: str, rehash: bool
     ) -> dict[int, list[int]]:
-        """重新检查画廊重复图片，返回 {首个图片 id: 重复图片 id 列表}。"""
+        """重新检查画廊重复图片，返回 {首个图片 id: 重复图片 id 列表}。
+
+        锁内只取 pics 快照；O(n²) 去重与 rehash（都可能是数十秒级）放在锁外
+        （仍在 to_thread 里）执行，避免阻塞上传/删除。写回哈希/落库时再取短锁。
+        因为用的是快照，期间并发新增的图片可能漏检，但不会和写操作互相覆盖。
+        """
         async with self._lock:
             g = self.find_gall(name_or_alias, raise_if_nofound=True)
+            gall_name = g.name
+            snapshot = [(p.pid, p.path, p.file, p.hash1, p.hash2) for p in g.pics]
 
-            def check() -> dict[int, list[int]]:
-                # ret[pid] = (首个图, 重复的后续图片列表)
-                ret: dict[int, tuple[GalleryPic, list[GalleryPic]]] = {}
-                for pic in g.pics[:]:
-                    if rehash:
-                        pic.calc_hash()
-                    sim_pid = None
-                    for k, (first_pic, _) in ret.items():
-                        if pic.is_same(
-                            first_pic,
-                            self._img_proc.hash1_threshold,
-                            self._img_proc.hash2_threshold,
+        def check() -> tuple[
+            dict[int, list[int]], dict[int, tuple[str, str, str, str]]
+        ]:
+            h1_threshold = self._img_proc.hash1_threshold
+            h2_threshold = self._img_proc.hash2_threshold
+            # pid -> (file, 快照时的 hash1, 新 hash1, 新 hash2)
+            new_hashes: dict[int, tuple[str, str, str, str]] = {}
+            entries: list[tuple[int, str, str, str]] = []  # (pid, file, hash1, hash2)
+
+            for pid, path, file, hash1, hash2 in snapshot:
+                if rehash:
+                    tmp = GalleryPic(
+                        gall_name=gall_name,
+                        pid=pid,
+                        file=file,
+                        _data_dir=self._data_dir,
+                    )
+                    try:
+                        tmp.calc_hash(path)
+                    except Exception as e:
+                        logger.warning(
+                            f"重新计算画廊图片 {pid} hash 失败，跳过: {get_exc_desc(e)}"
+                        )
+                        continue
+                    new_hashes[pid] = (file, hash1, tmp.hash1, tmp.hash2)
+                    hash1, hash2 = tmp.hash1, tmp.hash2
+                if not hash1 or not hash2:
+                    continue
+                # 旧数据可能带非法 hash 字符串，先探测再参与比对，避免整次检查中断
+                try:
+                    int(hash1, 16)
+                    bytes.fromhex(hash2)
+                except (TypeError, ValueError):
+                    logger.warning(f"画廊图片 {pid} 的 hash 非法，跳过查重")
+                    continue
+                entries.append((pid, file, hash1, hash2))
+
+            # ret[pid] = (首个图, 重复的后续图片列表)
+            ret: dict[int, tuple[GalleryPic, list[GalleryPic]]] = {}
+            for pid, file, h1, h2 in entries:
+                pic = GalleryPic(
+                    gall_name=gall_name,
+                    pid=pid,
+                    file=file,
+                    hash1=h1,
+                    hash2=h2,
+                    _data_dir=self._data_dir,
+                )
+                sim_pid = None
+                for first_pid, (first_pic, _) in ret.items():
+                    if pic.is_same(first_pic, h1_threshold, h2_threshold):
+                        sim_pid = first_pid
+                        break
+                if sim_pid is not None:
+                    ret[sim_pid][1].append(pic)
+                else:
+                    ret[pid] = (pic, [])
+            return (
+                {k: [p.pid for p in v[1]] for k, v in ret.items() if v[1]},
+                new_hashes,
+            )
+
+        result, new_hashes = await asyncio.to_thread(check)
+
+        if rehash:
+            # 短锁写回：只更新快照期间没被并发替换/改动 hash 的图片，
+            # 避免覆盖 replace/add 刚写入的新 hash。
+            async with self._lock:
+                g = self.find_gall(gall_name, raise_if_nofound=False)
+                if g is not None:
+                    applied = 0
+                    for pic in g.pics:
+                        rec = new_hashes.get(pic.pid)
+                        if (
+                            rec is not None
+                            and rec[0] == pic.file
+                            and rec[1] == pic.hash1
                         ):
-                            sim_pid = k
-                            break
-                    if sim_pid is not None:
-                        ret[sim_pid][1].append(pic)
-                    else:
-                        ret[pic.pid] = (pic, [])
-                return {k: [p.pid for p in v[1]] for k, v in ret.items() if v[1]}
-
-            result = await asyncio.to_thread(check)
-            if rehash:
-                await self._save()
-            return result
+                            pic.hash1, pic.hash2 = rec[2], rec[3]
+                            applied += 1
+                    await self._save()
+                    logger.info(
+                        f'画廊"{gall_name}"rehash 写回 {applied}/{len(new_hashes)} 张图片的 hash'
+                    )
+        return result
 
 
 # ==================== 辅助异常与函数 ====================
@@ -590,3 +914,18 @@ class ReplyException(Exception):
 def get_exc_desc(e: Exception) -> str:
     """获取异常的简短描述，用于日志。"""
     return f"{type(e).__name__}: {e}"
+
+
+def quarantine_corrupt_file(path: str, desc: str = "数据文件") -> str | None:
+    """把损坏的 JSON 文件改名为 <原路径>.corrupt-<时间戳>，返回新路径。
+
+    返回 None 表示改名失败（原文件保留，调用方仍以空库启动并记录错误）。
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    dest = f"{path}.corrupt-{stamp}"
+    try:
+        os.replace(path, dest)
+        return dest
+    except Exception as e:
+        logger.error(f"备份损坏的{desc} {path} 失败: {get_exc_desc(e)}")
+        return None

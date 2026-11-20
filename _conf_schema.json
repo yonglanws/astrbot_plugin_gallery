@@ -30,10 +30,10 @@
     "hint": "超过该时长后普通用户将无法撤销自己的上传"
   },
   "enable_slash_prefix": {
-    "description": "是否兼容 / 前缀。开启时 /看 与 看 都生效；关闭时仅接受不带 / 的裸指令",
+    "description": "是否兼容 / 前缀。仅对 listen_all_messages 全消息监听模式生效：开启时 /看 与 看 都生效，关闭时仅接受不带 / 的裸指令；原生指令路径由 AstrBot 的 wake_prefix 决定",
     "type": "bool",
     "default": true,
-    "hint": "对被唤醒(@机器人/唤醒前缀)的消息生效"
+    "hint": "原生指令（@机器人/唤醒前缀/私聊）到达插件前已被 AstrBot 剥掉唤醒前缀，此开关管不到；它只影响全消息监听模式下收到的裸消息"
   },
   "listen_all_messages": {
     "description": "允许监听所有消息（免唤醒）",

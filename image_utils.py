@@ -38,6 +38,58 @@ THUMBNAIL_SIZE = (64, 64)
 CARD_COVER_SIZE = (THUMBNAIL_SIZE[0] * 2, THUMBNAIL_SIZE[1] * 2)
 REPEAT_IMAGE_SHOW_SIZE = (128, 128)
 
+# 解码前的硬性上限：小体积的超大分辨率图片（如 0.1MB 的 15000×10000 PNG）
+# 按原尺寸解码会吃掉约 2GB 内存，必须在 load 之前拒绝。
+MAX_IMAGE_PIXELS = 50_000_000  # 50MP
+MAX_IMAGE_SIDE = 12000         # 单边上限
+# 与业务上限保持一致：Pillow 在超过该像素数时会告警，超过 2 倍会直接报错
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+# 动图累积帧的内存上限：帧数与「帧数 × 单帧像素」都要受控
+MAX_ANIMATED_FRAMES = 120
+MAX_ANIMATED_TOTAL_PIXELS = 60_000_000  # 60MP
+
+
+class ImageTooLargeError(Exception):
+    """图片解码尺寸超过业务上限；消息可直接展示给用户。"""
+
+
+def _too_large_message(width: int = 0, height: int = 0) -> str:
+    size_text = f"{width}×{height} 像素，" if width and height else ""
+    return (
+        f"图片尺寸过大（{size_text}超过上限 "
+        f"{MAX_IMAGE_PIXELS // 1_000_000}MP 或单边 {MAX_IMAGE_SIDE}px）"
+    )
+
+
+def _ensure_within_limits(width: int, height: int) -> None:
+    """在解码前校验像素总量与单边长度，超限直接抛用户可读异常。"""
+    if width <= 0 or height <= 0:
+        raise ValueError(f"图片尺寸无效: {width}×{height}")
+    if (
+        width * height > MAX_IMAGE_PIXELS
+        or width > MAX_IMAGE_SIDE
+        or height > MAX_IMAGE_SIDE
+    ):
+        raise ImageTooLargeError(_too_large_message(width, height))
+
+
+def _open_image_checked(path: str) -> Image.Image:
+    """Image.open 后立即校验尺寸（open 只读文件头，不会解码像素）。"""
+    try:
+        img = Image.open(path)
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+        # 超过 Pillow 阈值时在 open 阶段就会抛错（Warning 被配置成 error 时同理），
+        # 转成用户可读异常
+        raise ImageTooLargeError(_too_large_message()) from None
+    try:
+        width, height = img.size
+        _ensure_within_limits(width, height)
+    except Exception:
+        img.close()
+        raise
+    return img
+
 
 # ==================== 配置容器 ====================
 
@@ -95,28 +147,74 @@ def _limit_image_by_pixels(img: Image.Image, target_pixels: int) -> Image.Image:
     return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
 
-def _limit_animated_gif(img: Image.Image, target_pixels: int, path: str) -> None:
-    """等比缩小动图的所有帧并保存为 GIF，保留帧数与帧时长。
+def _gif_frame_count(img: Image.Image) -> int:
+    try:
+        return max(1, int(getattr(img, "n_frames", 1) or 1))
+    except Exception:
+        return 1
+
+
+def _plan_gif_frames(n_frames: int, width: int, height: int) -> list[int]:
+    """计算动图应保留的帧下标。
+
+    同时受「帧数 <= MAX_ANIMATED_FRAMES」与
+    「帧数 × 单帧像素 <= MAX_ANIMATED_TOTAL_PIXELS」限制；
+    超限时等间隔抽取（保留首尾帧），返回按原顺序排列的下标。
+    """
+    n_frames = max(1, n_frames)
+    max_by_pixels = max(1, MAX_ANIMATED_TOTAL_PIXELS // max(1, width * height))
+    keep = min(n_frames, MAX_ANIMATED_FRAMES, max_by_pixels)
+    if keep >= n_frames:
+        return list(range(n_frames))
+    if keep <= 1:
+        return [0]
+    return [round(i * (n_frames - 1) / (keep - 1)) for i in range(keep)]
+
+
+def _limit_animated_gif(img: Image.Image, target_total_pixels: int, path: str) -> None:
+    """等比缩小动图的所有帧并保存为 GIF，保留帧时长。
 
     Image.resize 只作用于当前帧——对动画整图缩放会把动图退化成静帧，
     因此必须用 ImageSequence 逐帧取出缩放后再拼接保存。
+
+    target_total_pixels 是「所有保留帧加起来的像素预算」；帧数与总像素
+    超限时先等间隔抽帧，避免把每帧 convert("RGBA") 后全部累积进内存。
     """
+    n_frames = _gif_frame_count(img)
+    indices = _plan_gif_frames(n_frames, img.width, img.height)
+    if len(indices) < n_frames:
+        logger.warning(
+            f"动图超过帧数/总像素上限（{n_frames}帧 {img.width}×{img.height}），"
+            f"等间隔抽取 {len(indices)} 帧后保存"
+        )
+    budget = max(1, min(int(target_total_pixels), MAX_ANIMATED_TOTAL_PIXELS))
+    per_frame_target = max(1, min(budget // len(indices), MAX_IMAGE_PIXELS))
+    wanted = set(indices)
     frames: list[Image.Image] = []
     durations: list[int] = []
-    for frame in ImageSequence.Iterator(img):
-        frames.append(_limit_image_by_pixels(frame.convert("RGBA"), target_pixels))
-        durations.append(frame.info.get("duration", 100) or 100)
-    if not frames:
-        return
-    frames[0].save(
-        path,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
-        disposal=2,
-        loop=0,
-    )
+    try:
+        for idx, frame in enumerate(ImageSequence.Iterator(img)):
+            if idx not in wanted:
+                continue
+            frames.append(_limit_image_by_pixels(frame.convert("RGBA"), per_frame_target))
+            durations.append(frame.info.get("duration", 100) or 100)
+        if not frames:
+            return
+        frames[0].save(
+            path,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=durations,
+            disposal=2,
+            loop=0,
+        )
+    finally:
+        for frame in frames:
+            try:
+                frame.close()
+            except Exception:
+                pass
 
 
 def _save_transparent_static_gif(img: Image.Image, path: str) -> None:
@@ -158,36 +256,53 @@ def _get_gif_duration(img: Image.Image) -> int:
 def process_image_for_gallery(path: str, sub_type: int, size_limit_mb: float) -> None:
     """入库前对图片进行格式修正与大小限制。
 
+    解码前先做像素/单边硬性校验，超限抛 ImageTooLargeError（用户可读），
+    避免小体积超大分辨率图片按原尺寸解码耗尽内存。
+
     Args:
         path: 图片本地路径（会被原地覆盖）
         sub_type: 是否为表情包（>0 表示是表情）
         size_limit_mb: 大小上限(MB)，超过则等比缩小
+
+    Raises:
+        ImageTooLargeError: 图片像素或单边超过 MAX_IMAGE_PIXELS / MAX_IMAGE_SIDE
     """
-    img = Image.open(path)
-    # 表情包静态图转静态 gif 以保留透明度（QQ 表情格式）
-    animated = _is_animated(img)
-    need_to_gif = bool(sub_type) and not animated
-    scaled = False
+    img = _open_image_checked(path)
+    try:
+        # 表情包静态图转静态 gif 以保留透明度（QQ 表情格式）
+        animated = _is_animated(img)
+        need_to_gif = bool(sub_type) and not animated
+        scaled = False
 
-    filesize_mb = os.path.getsize(path) / (1024 * 1024)
-    if filesize_mb > size_limit_mb:
-        pixels = _get_image_pixels(img)
-        target_pixels = int(pixels * size_limit_mb / filesize_mb)
-        if animated:
-            # 动图必须逐帧缩放；整图 resize 会退化为静帧
-            _limit_animated_gif(img, target_pixels, path)
+        filesize_mb = os.path.getsize(path) / (1024 * 1024)
+        if filesize_mb > size_limit_mb:
+            if animated:
+                # 动图必须逐帧缩放；整图 resize 会退化为静帧。
+                # 预算按「保留帧的总像素」估算，而不是单帧像素。
+                total_pixels = _get_image_pixels(img) * _gif_frame_count(img)
+                target_total_pixels = int(total_pixels * size_limit_mb / filesize_mb)
+                _limit_animated_gif(img, target_total_pixels, path)
+                new_size_mb = os.path.getsize(path) / (1024 * 1024)
+                logger.info(f"缩放过大的动图 {filesize_mb:.2f}M -> {new_size_mb:.2f}M")
+                return
+            pixels = _get_image_pixels(img)
+            target_pixels = min(
+                int(pixels * size_limit_mb / filesize_mb), MAX_IMAGE_PIXELS
+            )
+            resized = _limit_image_by_pixels(img, target_pixels)
+            if resized is not img:
+                img.close()
+            img = resized
+            scaled = True
+
+        if need_to_gif:
+            _save_transparent_static_gif(img, path)
+        elif scaled:
+            img.save(path)
             new_size_mb = os.path.getsize(path) / (1024 * 1024)
-            logger.info(f"缩放过大的动图 {filesize_mb:.2f}M -> {new_size_mb:.2f}M")
-            return
-        img = _limit_image_by_pixels(img, target_pixels)
-        scaled = True
-
-    if need_to_gif:
-        _save_transparent_static_gif(img, path)
-    elif scaled:
-        img.save(path)
-        new_size_mb = os.path.getsize(path) / (1024 * 1024)
-        logger.info(f"缩放过大的图片 {filesize_mb:.2f}M -> {new_size_mb:.2f}M")
+            logger.info(f"缩放过大的图片 {filesize_mb:.2f}M -> {new_size_mb:.2f}M")
+    finally:
+        img.close()
 
 
 # ==================== 渲染辅助 ====================
@@ -218,15 +333,18 @@ def _grid_row_count(n: int) -> int:
     return max(1, int(math.sqrt(max(1, n))))
 
 
+def _prefer_thumbnail(path: str) -> str:
+    """优先返回画廊缩略图（<原图>_thumb.jpg），不存在则回退原图。"""
+    thumb = f"{path}_thumb.jpg"
+    return thumb if os.path.exists(thumb) else path
+
+
 # ==================== 渲染器（原版 Pillow Canvas 风格） ====================
+# 每个 render_* 的同步核心都是普通函数，由 async 包装层用 asyncio.to_thread
+# 丢到工作线程执行，避免同步 PIL 绘制/写盘占住事件循环。
 
 
-async def render_gallery_list(items: list[dict], save_dir: str) -> str:
-    """渲染所有画廊的列表卡片网格。
-
-    items: [{'name', 'thumb_path', 'mode', 'count', 'size_text'}, ...]
-    thumb_path 为封面缩略图路径（可为 None）。
-    """
+def _render_gallery_list_sync(items: list[dict], save_dir: str) -> str:
     with Canvas(bg=FillBg(THUMBNAIL_BG_COLOR)).set_padding(8) as canvas:
         with Grid(row_count=_grid_row_count(len(items)), hsep=8, vsep=8) \
                 .set_item_align('t').set_content_align('t'):
@@ -242,15 +360,20 @@ async def render_gallery_list(items: list[dict], save_dir: str) -> str:
                     TextBox(f"{it['count']}张 {it['size_text']}",
                             TextStyle(DEFAULT_FONT, 20, BLACK))
 
-    img = await canvas.get_img()
+    img = canvas.get_img_sync()
     return _save_render(img, save_dir)
 
 
-async def render_pic_grid(pics: list[tuple], save_dir: str) -> str:
-    """渲染单个画廊的图片缩略图网格（也用于上传记录视图）。
+async def render_gallery_list(items: list[dict], save_dir: str) -> str:
+    """渲染所有画廊的列表卡片网格。
 
-    pics: [(thumb_path 或 None, pid), ...]
+    items: [{'name', 'thumb_path', 'mode', 'count', 'size_text'}, ...]
+    thumb_path 为封面缩略图路径（可为 None）。
     """
+    return await asyncio.to_thread(_render_gallery_list_sync, items, save_dir)
+
+
+def _render_pic_grid_sync(pics: list[tuple], save_dir: str) -> str:
     with Canvas(bg=FillBg(THUMBNAIL_BG_COLOR)).set_padding(8) as canvas:
         with Grid(row_count=_grid_row_count(len(pics)), hsep=4, vsep=4):
             for thumb_path, pid in pics:
@@ -263,15 +386,19 @@ async def render_pic_grid(pics: list[tuple], save_dir: str) -> str:
                         Spacer(w=THUMBNAIL_SIZE[0], h=THUMBNAIL_SIZE[1])
                     TextBox(str(pid), TextStyle(DEFAULT_FONT, 12, BLACK))
 
-    img = await canvas.get_img()
+    img = canvas.get_img_sync()
     return _save_render(img, save_dir)
 
 
-async def render_repeat(pairs: list[dict], hint: str, save_dir: str) -> str:
-    """渲染上传查重对比图：待上传图片 vs 已存在的相似图片。
+async def render_pic_grid(pics: list[tuple], save_dir: str) -> str:
+    """渲染单个画廊的图片缩略图网格（也用于上传记录视图）。
 
-    pairs: [{'new_path', 'old_path', 'old_pid'}, ...]（路径均可为 None）
+    pics: [(thumb_path 或 None, pid), ...]
     """
+    return await asyncio.to_thread(_render_pic_grid_sync, pics, save_dir)
+
+
+def _render_repeat_sync(pairs: list[dict], hint: str, save_dir: str) -> str:
     with Canvas(bg=FillBg(THUMBNAIL_BG_COLOR)).set_padding(8) as canvas:
         with VSplit().set_padding(8).set_sep(16).set_item_align('lt').set_content_align('lt'):
             if hint:
@@ -283,7 +410,8 @@ async def render_repeat(pairs: list[dict], hint: str, save_dir: str) -> str:
                         with VSplit().set_padding(0).set_sep(4) \
                                 .set_content_align('c').set_item_align('c'):
                             if pair["new_path"] and os.path.exists(pair["new_path"]):
-                                ImageBox(image=pair["new_path"], size=REPEAT_IMAGE_SHOW_SIZE,
+                                ImageBox(image=_prefer_thumbnail(pair["new_path"]),
+                                         size=REPEAT_IMAGE_SHOW_SIZE,
                                          image_size_mode='fit').set_content_align('c')
                             else:
                                 Spacer(w=REPEAT_IMAGE_SHOW_SIZE[0], h=REPEAT_IMAGE_SHOW_SIZE[1])
@@ -291,21 +419,26 @@ async def render_repeat(pairs: list[dict], hint: str, save_dir: str) -> str:
                         with VSplit().set_padding(0).set_sep(4) \
                                 .set_content_align('c').set_item_align('c'):
                             if pair["old_path"] and os.path.exists(pair["old_path"]):
-                                ImageBox(image=pair["old_path"], size=REPEAT_IMAGE_SHOW_SIZE,
+                                ImageBox(image=_prefer_thumbnail(pair["old_path"]),
+                                         size=REPEAT_IMAGE_SHOW_SIZE,
                                          image_size_mode='fit').set_content_align('c')
                             else:
                                 Spacer(w=REPEAT_IMAGE_SHOW_SIZE[0], h=REPEAT_IMAGE_SHOW_SIZE[1])
                             TextBox(f"pid: {pair['old_pid']}", TextStyle(DEFAULT_FONT, 16, BLACK))
 
-    img = await canvas.get_img()
+    img = canvas.get_img_sync()
     return _save_render(img, save_dir)
 
 
-async def render_check(groups: list[list[tuple]], save_dir: str) -> str:
-    """渲染查重结果：每组重复图片并排展示。
+async def render_repeat(pairs: list[dict], hint: str, save_dir: str) -> str:
+    """渲染上传查重对比图：待上传图片 vs 已存在的相似图片。
 
-    groups: [[(pic_path 或 None, pid), ...], ...]
+    pairs: [{'new_path', 'old_path', 'old_pid'}, ...]（路径均可为 None）
     """
+    return await asyncio.to_thread(_render_repeat_sync, pairs, hint, save_dir)
+
+
+def _render_check_sync(groups: list[list[tuple]], save_dir: str) -> str:
     with Canvas(bg=FillBg(THUMBNAIL_BG_COLOR)).set_padding(8) as canvas:
         with VSplit().set_padding(16).set_sep(8).set_item_align('lt').set_content_align('lt'):
             for group in groups:
@@ -315,12 +448,21 @@ async def render_check(groups: list[list[tuple]], save_dir: str) -> str:
                         with VSplit().set_padding(0).set_sep(4) \
                                 .set_content_align('c').set_item_align('c'):
                             if pic_path and os.path.exists(pic_path):
-                                ImageBox(image=pic_path, size=REPEAT_IMAGE_SHOW_SIZE,
+                                ImageBox(image=_prefer_thumbnail(pic_path),
+                                         size=REPEAT_IMAGE_SHOW_SIZE,
                                          image_size_mode='fit').set_content_align('c')
                             else:
                                 Spacer(w=REPEAT_IMAGE_SHOW_SIZE[0],
                                        h=REPEAT_IMAGE_SHOW_SIZE[1])
                             TextBox(f"pid: {pid}", TextStyle(DEFAULT_FONT, 16, BLACK))
 
-    img = await canvas.get_img()
+    img = canvas.get_img_sync()
     return _save_render(img, save_dir)
+
+
+async def render_check(groups: list[list[tuple]], save_dir: str) -> str:
+    """渲染查重结果：每组重复图片并排展示。
+
+    groups: [[(pic_path 或 None, pid), ...], ...]
+    """
+    return await asyncio.to_thread(_render_check_sync, groups, save_dir)

@@ -112,6 +112,7 @@ gallery_pkg.__path__ = [_pkg_dir]
 sys.modules["astrbot_plugin_gallery"] = gallery_pkg
 
 # 导入子模块
+import astrbot_plugin_gallery.gallery_manager as gallery_manager_mod
 from astrbot_plugin_gallery.gallery_manager import (
     GalleryManager, Gallery, GalleryPic, GalleryMode,
     GalleryPicRepeatedException, ReplyException,
@@ -119,6 +120,7 @@ from astrbot_plugin_gallery.gallery_manager import (
 from astrbot_plugin_gallery.image_utils import (
     ImageProcessor, process_image_for_gallery,
     render_gallery_list, render_pic_grid, render_repeat, render_check,
+    ImageTooLargeError,
 )
 from astrbot_plugin_gallery.history import HistoryManager
 
@@ -362,7 +364,14 @@ async def test_image_processing(r: TestResults, tmpdir):
     static_path = os.path.join(tmpdir, "static.png")
     PImage.new("RGBA", (50, 50), (0, 0, 255, 255)).save(static_path, format="PNG")
     process_image_for_gallery(static_path, sub_type=1, size_limit_mb=1.0)
-    r.check("静态表情包转为 gif", static_path.lower().endswith(".png"))  # 路径不变但内容变 gif
+    # 路径不变但内容变 gif：检查文件真实内容（魔数），而不是恒真的后缀断言
+    with open(static_path, "rb") as _f:
+        magic = _f.read(6)
+    r.check(
+        "静态表情包落盘为 GIF 内容",
+        magic in (b"GIF87a", b"GIF89a"),
+        f"magic={magic!r}",
+    )
     img = PImage.open(static_path)
     r.check("转换后为 GIF 格式", img.format == "GIF", f"format={img.format}")
 
@@ -516,6 +525,187 @@ async def test_check_gallery(r: TestResults, tmpdir):
         r.check("重复组有1个重复图", len(dup_pids) == 1, f"dup={dup_pids}")
 
 
+async def test_name_traversal_guard(r: TestResults, tmpdir):
+    """S1：非法画廊名不得建目录，close 也不得越界删除数据目录。"""
+    print("\n[测试] 非法画廊名目录防护")
+    img_proc = ImageProcessor(1.0, 5, 1000)
+
+    # 新建：名称校验必须拒绝 "." / ".." / 路径分隔符 / 空名
+    open_dir = os.path.join(tmpdir, "open_case")
+    mgr = GalleryManager(open_dir, img_proc)
+    mgr.ensure_loaded()
+    for bad in (".", "..", "a/b", "a\\b", ""):
+        raised = False
+        try:
+            mgr.open_gall(bad)
+        except AssertionError:
+            raised = True
+        r.check(
+            f"open_gall 拒绝非法名 {bad!r}",
+            raised and bad not in mgr.galleries,
+            f"raised={raised} galls={list(mgr.galleries)}",
+        )
+    r.check(
+        "非法 open 未创建 pics 目录",
+        not os.path.isdir(os.path.join(open_dir, "pics")),
+        f"pics_exists={os.path.isdir(os.path.join(open_dir, 'pics'))}",
+    )
+
+    # 旧数据里已有 ".." 画廊：close 只能移除记录，绝不能 rmtree(data_dir)
+    legacy_dir = os.path.join(tmpdir, "legacy_dotdot")
+    legit_dir = os.path.join(legacy_dir, "pics", "legit")
+    os.makedirs(legit_dir, exist_ok=True)
+    legit_img = os.path.join(legit_dir, "one.png")
+    make_test_image(legit_img, color=(5, 6, 7))
+    marker = os.path.join(legacy_dir, "keep_me.txt")
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write("data")
+    with open(os.path.join(legacy_dir, "gallery.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "pid_top": 1,
+            "galleries": {
+                "..": {
+                    "name": "..",
+                    "aliases": [],
+                    "mode": "edit",
+                    "cover_pid": None,
+                    "pics": [],
+                },
+                "legit": {
+                    "name": "legit",
+                    "aliases": [],
+                    "mode": "edit",
+                    "cover_pid": None,
+                    "pics": [{"pid": 1, "file": "one.png"}],
+                },
+            },
+        }, f)
+    mgr2 = GalleryManager(legacy_dir, img_proc)
+    mgr2.ensure_loaded()
+    r.check("旧数据非法名画廊可加载", ".." in mgr2.galleries)
+    mgr2.close_gall("..")
+    r.check("close('..') 只移除记录", ".." not in mgr2.galleries)
+    r.check("close('..') 后数据目录仍在", os.path.isdir(legacy_dir))
+    r.check("close('..') 后图片文件仍在", os.path.isfile(legit_img), f"path={legit_img}")
+    r.check(
+        "close('..') 后数据文件仍在",
+        os.path.isfile(marker)
+        and os.path.isfile(os.path.join(legacy_dir, "gallery.json")),
+    )
+
+
+async def test_replace_failure_keeps_old(r: TestResults, tmpdir):
+    """S3：替换图片拷贝失败时旧图仍在，JSON 不会指向已删除的文件。"""
+    print("\n[测试] 替换图片失败保留旧图")
+    img_proc = ImageProcessor(1.0, 5, 1000)
+    mgr = GalleryManager(tmpdir, img_proc)
+    mgr.ensure_loaded()
+    mgr.open_gall("replace_test")
+    await mgr._save()
+
+    old_src = os.path.join(tmpdir, "old.png")
+    new_src = os.path.join(tmpdir, "new.png")
+    make_test_image(old_src, color=(10, 20, 30), size=(60, 60))
+    make_different_image(new_src, color=(200, 100, 50), size=(60, 60))
+    pid = await mgr.async_add_pic("replace_test", old_src, check_duplicated=False)
+    pic = mgr.find_pic(pid)
+    old_path, old_thumb, old_file = pic.path, pic.thumb_path, pic.file
+    r.check("替换前旧图存在", os.path.isfile(old_path) and os.path.isfile(old_thumb))
+
+    orig_shutil = gallery_manager_mod.shutil
+
+    def _boom_copy(src, dst, *a, **k):
+        raise OSError("模拟拷贝失败")
+
+    # 只替换 gallery_manager 模块内的 shutil，避免影响 PIL 等全局使用者
+    gallery_manager_mod.shutil = types.SimpleNamespace(
+        copy2=_boom_copy, rmtree=orig_shutil.rmtree
+    )
+    raised = False
+    try:
+        await mgr.async_replace_pic(pid, new_src, check_duplicated=False)
+    except OSError:
+        raised = True
+    finally:
+        gallery_manager_mod.shutil = orig_shutil
+
+    r.check("替换拷贝失败会抛错", raised)
+    r.check("替换失败后旧图仍在", os.path.isfile(old_path), f"path={old_path}")
+    r.check("替换失败后旧缩略图仍在", os.path.isfile(old_thumb), f"path={old_thumb}")
+    r.check(
+        "替换失败后内存仍指向旧图",
+        mgr.find_pic(pid).file == old_file,
+        f"file={mgr.find_pic(pid).file}",
+    )
+
+    with open(os.path.join(tmpdir, "gallery.json"), encoding="utf-8") as f:
+        dumped = json.load(f)
+    rec = dumped["galleries"]["replace_test"]["pics"][0]
+    r.check("替换失败后 JSON 仍指向旧图", rec.get("file") == old_file, f"rec={rec}")
+
+    # 新 manager 重新加载：JSON 指向的文件必须真实存在（不能指向已删文件）
+    mgr2 = GalleryManager(tmpdir, img_proc)
+    mgr2.ensure_loaded()
+    reloaded = mgr2.find_pic(pid)
+    r.check(
+        "替换失败后重载图片文件存在",
+        reloaded is not None and os.path.isfile(reloaded.path),
+        f"path={getattr(reloaded, 'path', None)}",
+    )
+    leftovers = [
+        n for n in os.listdir(os.path.dirname(old_path)) if n.startswith(".replace-")
+    ]
+    r.check("替换失败无临时文件残留", leftovers == [], f"leftovers={leftovers}")
+
+
+async def test_oversized_image_rejected(r: TestResults, tmpdir):
+    """I1：超像素 / 超大单边图片在解码前被拒，并给出可读提示。"""
+    print("\n[测试] 超像素图片拒绝")
+    from PIL import Image as PImage
+    os.makedirs(tmpdir, exist_ok=True)
+
+    huge = os.path.join(tmpdir, "huge.png")
+    # 56MP > MAX_IMAGE_PIXELS(50MP)，但 PNG 体积极小（旧实现会按原尺寸解码）
+    PImage.new("1", (8000, 7000)).save(huge, format="PNG")
+    before = os.path.getsize(huge)
+    raised = None
+    try:
+        process_image_for_gallery(huge, sub_type=1, size_limit_mb=1.0)
+    except ImageTooLargeError as e:
+        raised = e
+    r.check(
+        "超像素图片被拒绝",
+        raised is not None,
+        f"异常={type(raised).__name__ if raised else None}",
+    )
+    r.check(
+        "超像素提示可读且含尺寸",
+        raised is not None
+        and "图片尺寸过大" in str(raised)
+        and "8000×7000" in str(raised),
+        f"msg={raised}",
+    )
+    r.check(
+        "超像素图片文件未被改写",
+        os.path.getsize(huge) == before,
+        f"{before}->{os.path.getsize(huge)}",
+    )
+
+    # 单边超过 12000px（像素总量不大）：同样在解码前拒绝
+    long_img = os.path.join(tmpdir, "long.png")
+    PImage.new("1", (13000, 100)).save(long_img, format="PNG")
+    raised2 = None
+    try:
+        process_image_for_gallery(long_img, sub_type=0, size_limit_mb=1.0)
+    except ImageTooLargeError as e:
+        raised2 = e
+    r.check(
+        "单边超限图片被拒绝",
+        raised2 is not None and "单边" in str(raised2),
+        f"msg={raised2}",
+    )
+
+
 async def test_draw_toolkit(r: TestResults, tmpdir):
     """测试 draw.py 布局工具包基础能力。"""
     print("\n[测试] draw.py Pillow 布局工具包")
@@ -623,6 +813,9 @@ async def main():
         await test_renderers(r, os.path.join(base_tmp, "t6"))
         await test_persistence(r, os.path.join(base_tmp, "t7"))
         await test_check_gallery(r, os.path.join(base_tmp, "t8"))
+        await test_name_traversal_guard(r, os.path.join(base_tmp, "t9"))
+        await test_replace_failure_keeps_old(r, os.path.join(base_tmp, "t10"))
+        await test_oversized_image_rejected(r, os.path.join(base_tmp, "t11"))
     finally:
         shutil.rmtree(base_tmp, ignore_errors=True)
     ok = r.summary()
