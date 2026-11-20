@@ -6,3 +6,6 @@ __pycache__/
 .vscode/
 *.log
 data/
+
+# ZCode 工作目录（草稿/会话缓存，不入库）
+.zcode/

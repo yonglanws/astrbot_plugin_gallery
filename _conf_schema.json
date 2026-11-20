@@ -40,5 +40,36 @@
     "type": "bool",
     "default": false,
     "hint": "默认指令走 AstrBot 原生注册，需 @机器人/唤醒前缀/私聊触发；开启后额外监听所有消息，未唤醒的群消息也能用裸指令触发（含 看miku 无空格写法）"
+  },
+  "ai_review": {
+    "description": "AI 审核设置（需要 AstrBot 已配置可用的 LLM 提供者，建议使用支持视觉/识图的模型）",
+    "type": "object",
+    "hint": "上传图片时调用 LLM 判定内容是否合规，不通过的图片不会入库",
+    "items": {
+      "enable": {
+        "description": "是否启用 AI 审核",
+        "type": "bool",
+        "default": false,
+        "hint": "审核服务不可用或输出无法解析时会放行图片并记录日志，不阻塞上传"
+      },
+      "provider_id": {
+        "description": "审核使用的 LLM 提供者",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "下拉选择一个提供者；留空使用当前默认提供者，建议选择支持视觉/识图的模型"
+      },
+      "batch_notice_threshold": {
+        "description": "一次上传图片达到该数量时，先提示「图片较多，正在进行 AI 审核，请耐心等待」",
+        "type": "int",
+        "default": 10
+      },
+      "prompt": {
+        "description": "审核判定提示词",
+        "type": "string",
+        "default": "你是群表情画廊的图片审核员，判断这张图片能否收录到表情/梗图库。不允许：色情低俗、血腥暴力、政治敏感、赌博毒品等违法违规内容、广告引流（二维码/联系方式）。允许：普通表情包、梗图、动漫/游戏/生活截图等日常内容。只输出 JSON，不要输出其他任何内容：通过时输出 {\"pass\": true}，不通过时输出 {\"pass\": false, \"reason\": \"简短原因\"}",
+        "hint": "要求模型只输出 JSON: {\"pass\": bool, \"reason\": str}，程序按此解析审核结果"
+      }
+    }
   }
 }

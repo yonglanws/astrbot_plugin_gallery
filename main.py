@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -36,6 +37,10 @@ from .image_utils import ImageProcessor, process_image_for_gallery
 
 # "以文件方式发送"的图片按扩展名识别：文件名/路径/链接带这些扩展名才尝试提取
 IMAGE_FILE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+class SilentPassException(Exception):
+    """静默放行：不回复任何内容，也不停止事件传播（消息继续交给 LLM/其他插件）。"""
 
 
 @register(
@@ -76,6 +81,23 @@ class GalleryPlugin(Star):
         self.enable_slash_prefix = bool(self.config.get("enable_slash_prefix", True))
         self.listen_all_messages = bool(
             self.config.get("listen_all_messages", False)
+        )
+        review = self.config.get("ai_review", {}) or {}
+        self.ai_review_enable = bool(review.get("enable", False))
+        self.ai_review_provider_id = str(review.get("provider_id", "") or "")
+        self.ai_review_notice_threshold = int(
+            review.get("batch_notice_threshold", 10)
+        )
+        self.ai_review_prompt = str(
+            review.get("prompt")
+            or (
+                "你是群表情画廊的图片审核员，判断这张图片能否收录到表情/梗图库。"
+                "不允许：色情低俗、血腥暴力、政治敏感、赌博毒品等违法违规内容、"
+                "广告引流（二维码/联系方式）。"
+                "允许：普通表情包、梗图、动漫/游戏/生活截图等日常内容。"
+                '只输出 JSON，不要输出其他任何内容：通过时输出 {"pass": true}，'
+                '不通过时输出 {"pass": false, "reason": "简短原因"}'
+            )
         )
 
     async def initialize(self):
@@ -214,6 +236,9 @@ class GalleryPlugin(Star):
             yield event.plain_result(str(e))
         except AssertionError as e:
             yield event.plain_result(str(e))
+        except SilentPassException:
+            # 「看」参数缺失/无法解析：群聊里极易误触发，静默放行不回复不拦截
+            return
         except Exception as e:
             logger.error(f"画廊指令处理出错 [{cmd}]: {get_exc_desc(e)}")
             yield event.plain_result(f"处理出错: {e}")
@@ -251,7 +276,7 @@ class GalleryPlugin(Star):
         """根据指令名分发到对应处理器。"""
         # 看图（普通用户）：内部直发合并消息链，不经过分段回复管线
         if cmd == "看":
-            await self._cmd_pick(event, args)
+            await self._cmd_pick(event, args, silent_usage=True)
         elif cmd == "看所有" or cmd == "看全部":
             async for r in self._cmd_list(event, args):
                 yield r
@@ -418,11 +443,28 @@ class GalleryPlugin(Star):
 
     # ==================== 指令实现 ====================
 
-    async def _cmd_pick(self, event: AstrMessageEvent, args: str):
-        """看图：随机或按 pid 查看画廊图片。"""
+    @staticmethod
+    def _pick_usage(silent: bool, msg: str) -> None:
+        """「看」参数缺失/无法解析：silent 时静默放行，否则沿用用法提示。
+
+        /gall pick 仍保留用法提示（显式调用，不会是误触发）。
+        """
+        if silent:
+            raise SilentPassException()
+        raise ReplyException(msg)
+
+    async def _cmd_pick(
+        self, event: AstrMessageEvent, args: str, silent_usage: bool = False
+    ):
+        """看图：随机或按 pid 查看画廊图片。
+
+        silent_usage=True（「看」指令）时，参数缺失或无法解析一律静默放行：
+        群聊里以「看」开头的普通消息很常见，回复用法提示会造成大量误触发。
+        """
         if not args:
-            raise ReplyException(
-                "使用方式:\n/看 画廊名称\n/看 画廊名称 x2\n/看 画廊名称 -1\n/看 123 456..."
+            self._pick_usage(
+                silent_usage,
+                "使用方式:\n/看 画廊名称\n/看 画廊名称 x2\n/看 画廊名称 -1\n/看 123 456...",
             )
         import random
 
@@ -443,7 +485,15 @@ class GalleryPlugin(Star):
                 try:
                     nindex = int(nindex_str)
                 except ValueError:
-                    raise ReplyException("使用方式:\n/看 画廊名称\n/看 画廊名称 x2\n/看 画廊名称 -1")
+                    self._pick_usage(
+                        silent_usage,
+                        "使用方式:\n/看 画廊名称\n/看 画廊名称 x2\n/看 画廊名称 -1",
+                    )
+                if not a.strip():
+                    # 「看 - 1」这类缺少画廊名的写法：同样静默放行
+                    self._pick_usage(
+                        silent_usage, "使用方式:\n/看 画廊名称\n/看 画廊名称 -1"
+                    )
                 g = self.gallery_manager.find_gall(a.strip(), raise_if_nofound=True)
                 if len(g.pics) < nindex:
                     raise ReplyException(f'画廊"{a.strip()}"仅有{len(g.pics)}张图片')
@@ -453,7 +503,14 @@ class GalleryPlugin(Star):
                 try:
                     num = int(num_str)
                 except ValueError:
-                    raise ReplyException("使用方式:\n/看 画廊名称\n/看 画廊名称 x2")
+                    self._pick_usage(
+                        silent_usage, "使用方式:\n/看 画廊名称\n/看 画廊名称 x2"
+                    )
+                if not a.strip():
+                    # 「看x2」这类缺少画廊名的写法：同样静默放行
+                    self._pick_usage(
+                        silent_usage, "使用方式:\n/看 画廊名称\n/看 画廊名称 x2"
+                    )
                 if not (1 <= num <= self.pick_limit):
                     raise ReplyException(f"一次查看图片数量必须在1到{self.pick_limit}之间")
             names = [a.strip()]
@@ -574,9 +631,32 @@ class GalleryPlugin(Star):
 
         paths = await asyncio.gather(*[fetch_local(u) for u in image_urls])
 
+        # AI 审核（配置启用时）。图片较多先提示等待，再并发送审；
+        # 审核服务异常或输出无法解析时降级放行，不阻塞上传。
+        review_results: list[tuple[bool, str] | None] = [None] * len(paths)
+        if self.ai_review_enable:
+            if len(paths) >= self.ai_review_notice_threshold:
+                yield event.plain_result(
+                    f"一次上传的图片较多（{len(paths)}张），"
+                    "正在进行 AI 审核，请耐心等待..."
+                )
+            to_review = [i for i, p in enumerate(paths) if p]
+            if to_review:
+                sem = asyncio.Semaphore(3)
+
+                async def _review_one(i: int):
+                    async with sem:
+                        review_results[i] = await self._ai_review_image(paths[i])
+
+                await asyncio.gather(*[_review_one(i) for i in to_review])
+
         for i, path in enumerate(paths, 1):
             if not path or not os.path.exists(path):
                 err_msg += f"第{i}张图片下载失败\n"
+                continue
+            review = review_results[i - 1]
+            if review is not None and not review[0]:
+                err_msg += f"第{i}张图片未通过AI审核: {review[1] or '内容不合规'}\n"
                 continue
             try:
                 await asyncio.to_thread(
@@ -1002,6 +1082,67 @@ class GalleryPlugin(Star):
             return new_path
         except OSError:
             return path
+
+    # ==================== AI 审核 ====================
+
+    def _get_review_provider(self):
+        """取审核用的 LLM 提供者：配置了 provider_id 用指定的，否则用当前默认。"""
+        try:
+            if self.ai_review_provider_id:
+                return self.context.get_provider_by_id(self.ai_review_provider_id)
+            return self.context.get_using_provider()
+        except Exception as e:
+            logger.warning(f"获取 LLM 提供者失败: {get_exc_desc(e)}")
+            return None
+
+    async def _ai_review_image(self, path: str) -> tuple[bool, str]:
+        """用 LLM 审核单张图片，返回 (是否通过, 原因)。
+
+        图片以本地路径传给 text_chat（AstrBot 会自动转 base64）。
+        审核服务不可用、请求失败或输出无法解析时放行（降级不阻塞上传），
+        仅记录日志。
+        """
+        provider = self._get_review_provider()
+        if provider is None:
+            logger.warning("AI审核已启用但没有可用的 LLM 提供者，图片直接放行")
+            return True, ""
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=self.ai_review_prompt,
+                    session_id=None,
+                    image_urls=[path],
+                    contexts=[],
+                ),
+                timeout=90,
+            )
+        except Exception as e:
+            logger.warning(f"AI审核请求失败（放行）: {get_exc_desc(e)}")
+            return True, ""
+        text = (getattr(resp, "completion_text", "") or "").strip()
+        passed, reason = self._parse_review_result(text)
+        if not passed:
+            logger.info(f"AI审核不通过({os.path.basename(path)}): {reason}")
+        return passed, reason
+
+    @staticmethod
+    def _parse_review_result(text: str) -> tuple[bool, str]:
+        """解析模型审核输出；无法解析时放行。"""
+        m = re.search(r"\{[^{}]*\}", text, re.S)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                return bool(data.get("pass", True)), str(data.get("reason") or "")
+            except Exception:
+                pass
+        lowered = text.lower()
+        if (
+            '"pass": false' in lowered
+            or "'pass': false" in lowered
+            or "不通过" in text
+        ):
+            return False, text[:100]
+        return True, ""
 
     async def _extract_image_urls(self, event: AstrMessageEvent) -> list[str]:
         """从消息中提取图片 URL。

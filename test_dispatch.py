@@ -542,12 +542,70 @@ async def main():
         f"res={res11} stopped={ev11.stopped}",
     )
 
-    # ---- 7. 错误指令的使用提示 ----
+    # ---- 7. 参数缺失/无法解析：静默放行（群聊里以「看」开头极易误触发） ----
     ev12 = MockEvent("看")
     res12 = await run_handler(plugin3, ev12)
     r.check(
-        "看 无参数返回使用方式",
-        len(res12) == 1 and "使用方式" in res12[0][1],
+        "看 无参数静默放行",
+        len(res12) == 0 and ev12.stopped is False,
+        f"res={res12} stopped={ev12.stopped}",
+    )
+
+    ev12b = MockEvent("看x2")
+    res12b = await run_handler(plugin3, ev12b)
+    r.check(
+        "看x2 空画廊名静默放行",
+        len(res12b) == 0 and ev12b.stopped is False,
+        f"res={res12b} stopped={ev12b.stopped}",
+    )
+
+    ev12c = MockEvent("看 中文画廊 -x")
+    res12c = await run_handler(plugin3, ev12c)
+    r.check(
+        "-N 后缀解析失败静默放行",
+        len(res12c) == 0 and ev12c.stopped is False,
+        f"res={res12c} stopped={ev12c.stopped}",
+    )
+
+    ev12d = MockEvent("看 中文画廊 xabc")
+    res12d = await run_handler(plugin3, ev12d)
+    r.check(
+        "xN 后缀解析失败静默放行",
+        len(res12d) == 0 and ev12d.stopped is False,
+        f"res={res12d} stopped={ev12d.stopped}",
+    )
+
+    ev12e = MockEvent("看 - 1")
+    res12e = await run_handler(plugin3, ev12e)
+    r.check(
+        "看 - 1 空画廊名静默放行",
+        len(res12e) == 0 and ev12e.stopped is False,
+        f"res={res12e} stopped={ev12e.stopped}",
+    )
+
+    # 原生注册路径共用 _handle_cmd，同样静默放行
+    ev12f = MockEvent("看", wake=True)
+    res12f = await run_native(plugin3, ev12f, "cmd_pick_native")
+    r.check(
+        "原生 看 无参数静默放行",
+        len(res12f) == 0 and ev12f.stopped is False,
+        f"res={res12f} stopped={ev12f.stopped}",
+    )
+
+    ev12g = MockEvent("看x2", wake=True)
+    res12g = await run_native(plugin3, ev12g, "cmd_pick_native")
+    r.check(
+        "原生 看x2 静默放行",
+        len(res12g) == 0 and ev12g.stopped is False,
+        f"res={res12g} stopped={ev12g.stopped}",
+    )
+
+    ev12h = MockEvent("看 中文画廊 -x", wake=True)
+    res12h = await run_native(plugin3, ev12h, "cmd_pick_native")
+    r.check(
+        "原生 看 后缀解析失败静默放行",
+        len(res12h) == 0 and ev12h.stopped is False,
+        f"res={res12h} stopped={ev12h.stopped}",
     )
 
     # ---- 7b. 画廊不存在：查询类指令静默放行；写操作仍提示错误 ----
@@ -1100,6 +1158,211 @@ async def main():
         "file为内部hash时回退get_msg上传成功",
         len(plugin10.gallery_manager.galleries["引用传3"].pics) == 2,
         f"pics={len(plugin10.gallery_manager.galleries['引用传3'].pics)}",
+    )
+
+    # ---- 12. AI 审核 ----
+    print("\n[测试] AI 审核")
+
+    def chain_text(res):
+        """把 chain/plain 结果里的文本拼出来。"""
+        out = []
+        for kind, payload in res:
+            if kind == "chain":
+                out.extend(str(getattr(c, "text", "")) for c in payload)
+            elif kind == "plain":
+                out.append(str(payload))
+        return "\n".join(out)
+
+    def make_review_provider(outputs):
+        """按调用顺序返回预设 completion_text 的 mock LLM 提供者。"""
+        calls = []
+
+        async def text_chat(prompt=None, session_id=None, image_urls=None,
+                            contexts=None, **kw):
+            calls.append({"prompt": prompt, "image": (image_urls or [None])[0]})
+            i = len(calls) - 1
+            if isinstance(outputs, Exception):
+                raise outputs
+            return types.SimpleNamespace(
+                completion_text=outputs[min(i, len(outputs) - 1)]
+            )
+
+        prov = types.SimpleNamespace(text_chat=text_chat)
+        prov.calls = calls
+        return prov
+
+    def make_review_img(color: int):
+        """用整数做种子生成 8px 随机灰度方块图。
+
+        感知哈希缩图后仍保留大尺度结构，保证图片间查重判定互不重复
+        （纯色/细噪声图缩到 16x16 后几乎一致，会被判重）。
+        """
+        import random as _random
+        from PIL import Image as _PImgR
+        rng = _random.Random(color)
+        p = os.path.join(tempfile.gettempdir(), f"gallery_review_{color}.png")
+        img = _PImgR.new("RGB", (64, 64))
+        px = img.load()
+        for bx in range(8):
+            for by in range(8):
+                v = rng.randrange(256)
+                for x in range(bx * 8, bx * 8 + 8):
+                    for y in range(by * 8, by * 8 + 8):
+                        px[x, y] = (v, v, v)
+        img.save(p, format="PNG")
+        return p
+
+    # 12a. 审核不通过：图片拒绝入库
+    prov_a = make_review_provider(['{"pass": false, "reason": "疑似广告二维码"}'])
+    plugin_ra = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 3}})
+    plugin_ra.context.get_using_provider = lambda: prov_a
+    plugin_ra.gallery_manager.ensure_loaded()
+    plugin_ra.gallery_manager.open_gall("审核画廊")
+    await plugin_ra.gallery_manager._save()
+    ev_ra = MockEvent("上传 审核画廊")
+    ev_ra.message_obj.message = [Comp.Image(file=make_review_img(112233))]
+    res_ra = await run_handler(plugin_ra, ev_ra)
+    r.check(
+        "AI不通过拒绝上传",
+        "未通过AI审核" in chain_text(res_ra),
+        f"res={chain_text(res_ra)}",
+    )
+    r.check(
+        "被拒图片未入库",
+        len(plugin_ra.gallery_manager.galleries["审核画廊"].pics) == 0,
+        f"pics={plugin_ra.gallery_manager.galleries['审核画廊'].pics}",
+    )
+    r.check("审核调用了LLM", len(prov_a.calls) == 1, f"calls={len(prov_a.calls)}")
+
+    # 12b. 审核通过：正常入库
+    prov_b = make_review_provider(['{"pass": true}'])
+    plugin_rb = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 3}})
+    plugin_rb.context.get_using_provider = lambda: prov_b
+    plugin_rb.gallery_manager.ensure_loaded()
+    plugin_rb.gallery_manager.open_gall("审核画廊2")
+    await plugin_rb.gallery_manager._save()
+    ev_rb = MockEvent("上传 审核画廊2")
+    ev_rb.message_obj.message = [Comp.Image(file=make_review_img(445566))]
+    res_rb = await run_handler(plugin_rb, ev_rb)
+    r.check(
+        "AI通过正常上传",
+        "成功上传1/1" in chain_text(res_rb)
+        and len(plugin_rb.gallery_manager.galleries["审核画廊2"].pics) == 1,
+        f"res={chain_text(res_rb)}",
+    )
+
+    # 12c. 批量上传达到阈值：先提示等待 AI 审核
+    prov_c = make_review_provider(['{"pass": true}'])
+    plugin_rc = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 2}})
+    plugin_rc.context.get_using_provider = lambda: prov_c
+    plugin_rc.gallery_manager.ensure_loaded()
+    plugin_rc.gallery_manager.open_gall("审核画廊3")
+    await plugin_rc.gallery_manager._save()
+    ev_rc = MockEvent("上传 审核画廊3")
+    ev_rc.message_obj.message = [
+        Comp.Image(file=make_review_img(10203)),
+        Comp.Image(file=make_review_img(30405)),
+        Comp.Image(file=make_review_img(50607)),
+    ]
+    res_rc = await run_handler(plugin_rc, ev_rc)
+    r.check(
+        "批量上传先提示AI审核等待",
+        len(res_rc) >= 2 and "AI 审核" in chain_text(res_rc[:1]),
+        f"res={[x[0] for x in res_rc]}",
+    )
+    r.check("批量审核每张都送审", len(prov_c.calls) == 3, f"calls={len(prov_c.calls)}")
+    r.check(
+        "批量全部通过入库",
+        len(plugin_rc.gallery_manager.galleries["审核画廊3"].pics) == 3,
+        f"pics={len(plugin_rc.gallery_manager.galleries['审核画廊3'].pics)} "
+        f"msg={chain_text(res_rc)}",
+    )
+
+    # 12d. 未达阈值不提示
+    prov_d = make_review_provider(['{"pass": true}'])
+    plugin_rd = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 10}})
+    plugin_rd.context.get_using_provider = lambda: prov_d
+    plugin_rd.gallery_manager.ensure_loaded()
+    plugin_rd.gallery_manager.open_gall("审核画廊4")
+    await plugin_rd.gallery_manager._save()
+    ev_rd = MockEvent("上传 审核画廊4")
+    ev_rd.message_obj.message = [Comp.Image(file=make_review_img(121314))]
+    res_rd = await run_handler(plugin_rd, ev_rd)
+    r.check(
+        "未达阈值不提示直接上传",
+        len(res_rd) == 1 and "成功上传1/1" in chain_text(res_rd),
+        f"res={[x[0] for x in res_rd]} {chain_text(res_rd)}",
+    )
+
+    # 12e. 审核服务异常：降级放行不阻塞上传
+    prov_e = make_review_provider(RuntimeError("provider down"))
+    plugin_re = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 99}})
+    plugin_re.context.get_using_provider = lambda: prov_e
+    plugin_re.gallery_manager.ensure_loaded()
+    plugin_re.gallery_manager.open_gall("审核画廊5")
+    await plugin_re.gallery_manager._save()
+    ev_re = MockEvent("上传 审核画廊5")
+    ev_re.message_obj.message = [Comp.Image(file=make_review_img(212223))]
+    res_re = await run_handler(plugin_re, ev_re)
+    r.check(
+        "审核服务异常降级放行",
+        "成功上传1/1" in chain_text(res_re)
+        and len(plugin_re.gallery_manager.galleries["审核画廊5"].pics) == 1,
+        f"res={chain_text(res_re)}",
+    )
+
+    # 12f. 输出无法解析：放行
+    prov_f = make_review_provider(["模型说了一堆没有JSON的话"])
+    plugin_rf = make_plugin({"ai_review": {"enable": True, "batch_notice_threshold": 99}})
+    plugin_rf.context.get_using_provider = lambda: prov_f
+    plugin_rf.gallery_manager.ensure_loaded()
+    plugin_rf.gallery_manager.open_gall("审核画廊6")
+    await plugin_rf.gallery_manager._save()
+    ev_rf = MockEvent("上传 审核画廊6")
+    ev_rf.message_obj.message = [Comp.Image(file=make_review_img(313233))]
+    res_rf = await run_handler(plugin_rf, ev_rf)
+    r.check(
+        "审核输出无法解析时放行",
+        "成功上传1/1" in chain_text(res_rf),
+        f"res={chain_text(res_rf)}",
+    )
+
+    # 12g. 审核关闭：完全不调用 provider
+    plugin_rg = make_plugin()
+    plugin_rg.gallery_manager.ensure_loaded()
+    plugin_rg.gallery_manager.open_gall("审核画廊7")
+    await plugin_rg.gallery_manager._save()
+    ev_rg = MockEvent("上传 审核画廊7")
+    ev_rg.message_obj.message = [Comp.Image(file=make_review_img(414243))]
+    res_rg = await run_handler(plugin_rg, ev_rg)
+    r.check(
+        "审核关闭时正常上传",
+        "成功上传1/1" in chain_text(res_rg),
+        f"res={chain_text(res_rg)}",
+    )
+
+    # 12h. 指定 provider_id 走 get_provider_by_id
+    prov_h = make_review_provider(['{"pass": true}'])
+    plugin_rh = make_plugin({
+        "ai_review": {"enable": True, "batch_notice_threshold": 99,
+                      "provider_id": "my_review_llm"},
+    })
+    plugin_rh.context.get_provider_by_id = lambda pid: (
+        prov_h if pid == "my_review_llm" else None
+    )
+    def _no_default():
+        raise AssertionError("不应使用默认提供者")
+    plugin_rh.context.get_using_provider = _no_default
+    plugin_rh.gallery_manager.ensure_loaded()
+    plugin_rh.gallery_manager.open_gall("审核画廊8")
+    await plugin_rh.gallery_manager._save()
+    ev_rh = MockEvent("上传 审核画廊8")
+    ev_rh.message_obj.message = [Comp.Image(file=make_review_img(515253))]
+    res_rh = await run_handler(plugin_rh, ev_rh)
+    r.check(
+        "provider_id 指定审核提供者",
+        "成功上传1/1" in chain_text(res_rh) and len(prov_h.calls) == 1,
+        f"res={chain_text(res_rh)} calls={len(prov_h.calls)}",
     )
 
     ok2 = r.summary()
