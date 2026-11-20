@@ -437,6 +437,36 @@ async def test_regressions(r):
     assert_no_reply(r, "取消上传们 不误触发撤销", res_m1c, f"stopped={ev_m1c.stopped}")
     r.check("取消上传们 不拦截", ev_m1c.stopped is False)
 
+    # M1b：「上传奶龙」无空格可用（画廊已存在）；「上传失败了」仍按普通聊天放行
+    plugin_m1x = make_plugin()
+    plugin_m1x.gallery_manager.ensure_loaded()
+    plugin_m1x.gallery_manager.open_gall("奶龙")
+    await plugin_m1x.gallery_manager._save()
+
+    res_m1x = await upload_file(plugin_m1x, "上传奶龙", make_review_img(43001))
+    text_m1x = chain_text(res_m1x)
+    r.check(
+        "上传奶龙 无空格也能上传",
+        "成功上传1/1" in text_m1x
+        and '到"奶龙"' in text_m1x
+        and len(plugin_m1x.gallery_manager.galleries["奶龙"].pics) == 1,
+        f"res={text_m1x}",
+    )
+
+    res_m1y = await upload_file(plugin_m1x, "添加奶龙", make_review_img(43002))
+    text_m1y = chain_text(res_m1y)
+    r.check(
+        "添加奶龙 无空格也能上传",
+        "成功上传1/1" in text_m1y
+        and len(plugin_m1x.gallery_manager.galleries["奶龙"].pics) == 2,
+        f"res={text_m1y}",
+    )
+
+    ev_m1z = MockEvent("上传失败了")
+    res_m1z = await run_handler(plugin_m1x, ev_m1z)
+    assert_no_reply(r, "上传失败了 不回复", res_m1z, f"stopped={ev_m1z.stopped}")
+    r.check("上传失败了 不拦截", ev_m1z.stopped is False, f"stopped={ev_m1z.stopped}")
+
     # M6：force 按独立 token 识别，画廊名里的 force 子串不能误伤
     plugin_m6 = make_plugin()
     plugin_m6.gallery_manager.ensure_loaded()

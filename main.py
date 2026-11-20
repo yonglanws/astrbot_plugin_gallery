@@ -279,25 +279,37 @@ class GalleryPlugin(Star):
     # 「添加失败了」会被当成上传指令抢答普通群聊。查询类（看/看所有/看全部）
     # 保持无空格前缀匹配，README 明确支持「看miku」这种写法。
     _WRITE_COMMANDS = {
-        "上传", "添加",
         "取消上传", "撤销上传", "回退上传",
         "上传记录",
         "创建画廊",
         "添加别名",
     }
 
+    # 「上传奶龙」「添加奶龙」这类无空格写法很常见，所以「上传/添加」不强制空格；
+    # 但普通聊天里「上传失败了」同样以「上传」开头，于是折中：无空格时，
+    # 后面第一个 token 必须正好是已有画廊名/别名才当指令，否则放行给 LLM。
+    _NAME_AWARE_COMMANDS = {"上传", "添加"}
+
     def _parse_cmd(self, body: str) -> tuple[str, str] | None:
         """从消息正文解析画廊指令。
 
         与原版 lunabot CmdHandler 一致：按最长前缀匹配，中文指令后可以不空格。
-        写操作类指令例外：指令名后必须是空白或行尾（见 _WRITE_COMMANDS）。
+        写操作类指令例外：指令名后必须是空白或行尾（见 _WRITE_COMMANDS）；
+        「上传/添加」额外允许无空格，但后面必须是已有画廊名/别名
+        （见 _NAME_AWARE_COMMANDS）。
         ASCII 指令（gall）要求词边界，避免 gallery 误触发 gall。
         """
         for cmd in self._COMMANDS:
             if not body.startswith(cmd):
                 continue
             rest = body[len(cmd):]
-            if cmd in self._WRITE_COMMANDS:
+            if cmd in self._NAME_AWARE_COMMANDS:
+                if rest and not rest[0].isspace():
+                    self.gallery_manager.ensure_loaded()
+                    token = rest.split(None, 1)[0]
+                    if self.gallery_manager.find_gall(token) is None:
+                        continue
+            elif cmd in self._WRITE_COMMANDS:
                 if rest and not rest[0].isspace():
                     continue
             elif rest and cmd.isascii() and rest[0].isalnum():
